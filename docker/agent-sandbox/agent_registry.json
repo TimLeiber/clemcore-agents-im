@@ -1,0 +1,10 @@
+[
+  {
+    "agent_name": "claude-code-sonnet",
+    "backend": "claude_code",
+    "agent_config": {
+      "model": "claude-sonnet-4-6",
+      "permission_mode": "bypassPermissions"
+    }
+  }
+]
