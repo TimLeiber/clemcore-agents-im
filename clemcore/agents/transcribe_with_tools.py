@@ -51,7 +51,7 @@ TOOL_TRACE_CSS = """
 }
 
 .msg.agent-reasoning p::before {
-    content: "Claude thinking\\A";
+    content: "AGENT thinking\\A";
     white-space: pre;
     font-weight: 700;
 }
@@ -69,7 +69,7 @@ TOOL_TRACE_CSS = """
 }
 
 .msg.agent-summary p::before {
-    content: "Claude\\A";
+    content: "AGENT\\A";
     white-space: pre;
     font-weight: 700;
 }
@@ -333,10 +333,592 @@ def _parse_result_message(line: str) -> dict[str, Any] | None:
     )
 
 
-def parse_agent_trace(trace_path: Path) -> list[dict[str, Any]]:
+def _canonical_tool_name(tool_name: str | None) -> str | None:
+    if tool_name in {"mcp_clem_game_start_game", "clem_game__start_game"}:
+        return "mcp__clem-game__start_game"
+
+    if tool_name in {"mcp_clem_game_submit_response", "clem_game__submit_response"}:
+        return "mcp__clem-game__submit_response"
+
+    if tool_name in {"mcp_clem_game_get_state", "clem_game__get_state"}:
+        return "mcp__clem-game__get_state"
+
+    return tool_name
+
+
+def _format_tool_call(tool_name: str,
+                      tool_input: dict[str, Any]) -> tuple[str, str | None]:
+    response = tool_input.get("response") if isinstance(tool_input, dict) else None
+    canonical_name = _canonical_tool_name(tool_name)
+
+    if canonical_name == "mcp__clem-game__start_game":
+        return "mcp__clem-game__start_game()", response
+
+    if canonical_name == "mcp__clem-game__submit_response":
+        return f"mcp__clem-game__submit_response(response={response!r})", response
+
+    return f"{tool_name}({json.dumps(tool_input, ensure_ascii=False)})", response
+
+
+def _parse_hermes_debug_tool_call(line: str) -> dict[str, Any] | None:
+    match = re.search(
+        r"Tool call: (?P<name>mcp_clem_game_[a-z_]+) with args: (?P<args>.*?)(?:\.\.\.)?$",
+        line,
+    )
+
+    if not match:
+        return None
+
+    tool_name = match.group("name")
+    raw_args = match.group("args").strip()
+
+    try:
+        tool_input = json.loads(raw_args)
+    except Exception:
+        tool_input = {"raw_args": raw_args}
+
+    content, response = _format_tool_call(tool_name, tool_input)
+
+    return _trace_event(
+        kind="tool-use",
+        content=content,
+        tool_name=_canonical_tool_name(tool_name),
+        response=response,
+    )
+
+
+def _parse_hermes_debug_reasoning(line: str) -> dict[str, Any] | None:
+    match = re.search(r"Captured reasoning \(\d+ chars\): (?P<reasoning>.*)$", line)
+
+    if not match:
+        return None
+
+    return _trace_event(
+        kind="reasoning",
+        content=match.group("reasoning").strip(),
+    )
+
+
+def _parse_hermes_tool_result_payload(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        structured = payload.get("structuredContent")
+
+        if isinstance(structured, dict):
+            return {
+                "reward": structured.get("reward"),
+                "done": structured.get("done"),
+                "metadata": structured.get("metadata"),
+                "context_summary": (
+                    "returned game observation; full text is shown in the Game Master bubble"
+                    if structured.get("context")
+                    else ""
+                ),
+            }
+
+        nested_result = payload.get("result")
+
+        if isinstance(nested_result, str):
+            return _parse_tool_result_content(nested_result)
+
+    return {
+        "content": payload,
+    }
+
+
+def _parse_hermes_debug_tool_result(line: str) -> dict[str, Any] | None:
+    match = re.search(r"Tool result \([^)]*\): (?P<payload>\{.*\})$", line)
+
+    if not match:
+        return None
+
+    try:
+        payload = json.loads(match.group("payload"))
+    except Exception:
+        return _trace_event(
+            kind="tool-result",
+            content=match.group("payload"),
+        )
+
+    parsed_content = _parse_hermes_tool_result_payload(payload)
+
+    parts = []
+
+    if "reward" in parsed_content:
+        parts.append(f"reward: {_format_scalar(parsed_content.get('reward'))}")
+    if "done" in parsed_content:
+        parts.append(f"done: {_format_scalar(parsed_content.get('done'))}")
+    if parsed_content.get("metadata"):
+        parts.append("metadata: " + json.dumps(parsed_content["metadata"], ensure_ascii=False))
+    if parsed_content.get("context_summary"):
+        parts.append("context: " + parsed_content["context_summary"])
+    if parsed_content.get("content") and not parts:
+        parts.append(str(parsed_content["content"]))
+
+    return _trace_event(
+        kind="tool-result",
+        content="\n".join(parts),
+        raw_result=parsed_content,
+    )
+
+
+def _parse_hermes_trace(text: str) -> list[dict[str, Any]]:
+    events = []
+    pending_tool_call = None
+    pending_reasoning_lines = None
+
+    timestamp_pattern = re.compile(r"^\d{2}:\d{2}:\d{2} - ")
+
+    def flush_reasoning() -> None:
+        nonlocal pending_reasoning_lines
+        nonlocal pending_tool_call
+
+        if pending_reasoning_lines is None:
+            return
+
+        content = "\n".join(pending_reasoning_lines).strip()
+
+        if content:
+            # Hermes logs the captured reasoning after the tool-call line.
+            # Render it before the tool call, matching the model's actual order.
+            events.append(_trace_event(kind="reasoning", content=content))
+
+            if pending_tool_call is not None:
+                events.append(pending_tool_call)
+                pending_tool_call = None
+
+        pending_reasoning_lines = None
+
+    for line in text.splitlines():
+        line = line.rstrip()
+
+        if pending_reasoning_lines is not None:
+            if timestamp_pattern.match(line):
+                flush_reasoning()
+            else:
+                pending_reasoning_lines.append(line)
+                continue
+
+        if not line:
+            continue
+
+        tool_call = _parse_hermes_debug_tool_call(line)
+
+        if tool_call is not None:
+            if pending_tool_call is not None:
+                events.append(pending_tool_call)
+
+            pending_tool_call = tool_call
+            continue
+
+        reasoning = _parse_hermes_debug_reasoning(line)
+
+        if reasoning is not None:
+            pending_reasoning_lines = [reasoning["content"]]
+            continue
+
+        tool_result = _parse_hermes_debug_tool_result(line)
+
+        if tool_result is not None:
+            flush_reasoning()
+
+            if pending_tool_call is not None:
+                events.append(pending_tool_call)
+                pending_tool_call = None
+
+            events.append(tool_result)
+            continue
+
+    flush_reasoning()
+
+    if pending_tool_call is not None:
+        events.append(pending_tool_call)
+
+    return events
+
+
+def _format_openclaw_tool_call(tool_name: str,
+                               tool_use_id: str | None,
+                               tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
+    canonical_name = _canonical_tool_name(tool_name)
+    tool_input = tool_input or {}
+    content, response = _format_tool_call(canonical_name or tool_name, tool_input)
+
+    if tool_use_id:
+        content += f"\ntool_use_id: {tool_use_id}"
+
+    return _trace_event(
+        kind="tool-use",
+        content=content,
+        tool_name=canonical_name,
+        tool_use_id=tool_use_id,
+        response=response,
+    )
+
+
+def _format_openclaw_tool_result(tool_name: str | None,
+                                 tool_use_id: str | None,
+                                 payload: Any | None = None,
+                                 is_error: bool | None = None) -> dict[str, Any]:
+    canonical_name = _canonical_tool_name(tool_name)
+
+    parsed_content = _parse_openclaw_tool_result_payload(payload)
+
+    parts = []
+
+    if tool_use_id:
+        parts.append(f"tool_use_id: {tool_use_id}")
+
+    if is_error is not None:
+        parts.append(f"is_error: {_format_scalar(is_error)}")
+
+    if "reward" in parsed_content:
+        parts.append(f"reward: {_format_scalar(parsed_content.get('reward'))}")
+    if "done" in parsed_content:
+        parts.append(f"done: {_format_scalar(parsed_content.get('done'))}")
+    if parsed_content.get("metadata"):
+        parts.append("metadata: " + json.dumps(parsed_content["metadata"], ensure_ascii=False))
+    if parsed_content.get("context_summary"):
+        parts.append("context: " + parsed_content["context_summary"])
+    if parsed_content.get("content") and not any(
+        item.startswith(("reward:", "done:", "metadata:", "context:"))
+        for item in parts
+    ):
+        parts.append(str(parsed_content["content"]))
+
+    if not parts:
+        parts.append("status: completed")
+
+    return _trace_event(
+        kind="tool-result",
+        content="\n".join(parts),
+        tool_name=canonical_name,
+        tool_use_id=tool_use_id,
+        raw_result=parsed_content,
+    )
+
+
+def _parse_openclaw_json_maybe(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    stripped = value.strip()
+
+    if not stripped:
+        return value
+
+    try:
+        return json.loads(stripped)
+    except Exception:
+        return value
+
+
+def _parse_openclaw_tool_arguments(value: Any) -> dict[str, Any]:
+    value = _parse_openclaw_json_maybe(value)
+
+    if isinstance(value, dict):
+        return value
+
+    return {"raw_args": value}
+
+
+def _parse_openclaw_tool_result_payload(payload: Any) -> dict[str, Any]:
+    payload = _parse_openclaw_json_maybe(payload)
+
+    if isinstance(payload, dict):
+        # OpenClaw session JSONL has used a few shapes across traces:
+        # - {"structuredContent": {...}}
+        # - {"content": {"structuredContent": {...}}}
+        # - {"result": "...json..."}
+        structured = payload.get("structuredContent")
+
+        if structured is None and isinstance(payload.get("details"), dict):
+            structured = payload["details"].get("structuredContent")
+
+        if structured is None and isinstance(payload.get("content"), dict):
+            structured = payload["content"].get("structuredContent")
+
+        if structured is None and isinstance(payload.get("content"), list):
+            for item in payload["content"]:
+                if not isinstance(item, dict):
+                    continue
+
+                text_value = item.get("text")
+
+                if not isinstance(text_value, str):
+                    continue
+
+                marker = "structuredContent:"
+
+                if marker not in text_value:
+                    continue
+
+                structured_candidate = _parse_openclaw_json_maybe(
+                    text_value.split(marker, 1)[1].strip()
+                )
+
+                if isinstance(structured_candidate, dict):
+                    structured = structured_candidate
+                    break
+
+        if structured is None and isinstance(payload.get("result"), dict):
+            structured = payload["result"].get("structuredContent")
+
+        if structured is None and isinstance(payload.get("result"), str):
+            return _parse_tool_result_content(payload["result"])
+
+        candidate = structured if isinstance(structured, dict) else payload
+
+        result = {}
+
+        if "reward" in candidate:
+            result["reward"] = candidate.get("reward")
+        if "done" in candidate:
+            result["done"] = candidate.get("done")
+        if "metadata" in candidate:
+            result["metadata"] = candidate.get("metadata")
+
+        context = candidate.get("context")
+
+        if isinstance(context, dict):
+            context_content = context.get("content", "")
+            result["context_summary"] = (
+                context_content.splitlines()[0]
+                if context_content
+                else "returned game observation; full text is shown in the Game Master bubble"
+            )
+
+        if result:
+            return result
+
+    if isinstance(payload, str):
+        return _parse_tool_result_content(payload)
+
+    return {
+        "content": payload,
+    }
+
+
+def _extract_openclaw_reasoning_from_part(part: dict[str, Any]) -> str | None:
+    part_type = str(part.get("type", "")).lower()
+
+    if "reason" not in part_type and "think" not in part_type:
+        return None
+
+    for key in [
+        "text",
+        "content",
+        "reasoning",
+        "thinking",
+        "summary",
+        "delta",
+    ]:
+        value = part.get(key)
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return None
+
+
+def _parse_openclaw_session_json_line(line: str) -> list[dict[str, Any]]:
+    stripped = line.strip()
+
+    if not stripped.startswith("{"):
+        return []
+
+    try:
+        record = json.loads(stripped)
+    except Exception:
+        return []
+
+    if record.get("type") != "message":
+        return []
+
+    message = record.get("message")
+
+    if not isinstance(message, dict):
+        return []
+
+    role = message.get("role")
+    content = message.get("content")
     events = []
 
-    for line in trace_path.read_text(encoding="utf-8").splitlines():
+    if not isinstance(content, list):
+        return events
+
+    if role == "assistant":
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+
+            reasoning_text = _extract_openclaw_reasoning_from_part(part)
+
+            if reasoning_text:
+                events.append(
+                    _trace_event(
+                        kind="reasoning",
+                        content=reasoning_text,
+                    )
+                )
+                continue
+
+            if part.get("type") == "toolCall":
+                tool_name = part.get("name")
+                tool_use_id = part.get("id")
+                tool_input = _parse_openclaw_tool_arguments(
+                    part.get("arguments", part.get("partialArgs", {}))
+                )
+
+                events.append(
+                    _format_openclaw_tool_call(
+                        tool_name=tool_name,
+                        tool_use_id=tool_use_id,
+                        tool_input=tool_input,
+                    )
+                )
+
+    elif role in {"tool", "toolResult"}:
+        if role == "toolResult":
+            events.append(
+                _format_openclaw_tool_result(
+                    tool_name=message.get("toolName"),
+                    tool_use_id=message.get("toolCallId"),
+                    payload=message,
+                    is_error=message.get("isError"),
+                )
+            )
+            return events
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+
+            if part.get("type") not in {"toolResult", "tool_result"}:
+                continue
+
+            events.append(
+                _format_openclaw_tool_result(
+                    tool_name=part.get("name") or part.get("toolName"),
+                    tool_use_id=(
+                        part.get("toolCallId")
+                        or part.get("tool_call_id")
+                        or part.get("id")
+                    ),
+                    payload=(
+                        part.get("content")
+                        if "content" in part
+                        else part.get("result")
+                    ),
+                    is_error=part.get("isError"),
+                )
+            )
+
+    return events
+
+
+def _parse_openclaw_console_trace(text: str) -> list[dict[str, Any]]:
+    events = []
+
+    tool_start_pattern = re.compile(
+        r"\[agent/embedded\] embedded run tool start: .*? "
+        r"tool=(?P<tool>\S+) toolCallId=(?P<id>\S+)"
+    )
+    tool_end_pattern = re.compile(
+        r"\[agent/embedded\] embedded run tool end: .*? "
+        r"tool=(?P<tool>\S+) toolCallId=(?P<id>\S+)"
+    )
+
+    for line in text.splitlines():
+        line = line.rstrip()
+
+        start_match = tool_start_pattern.search(line)
+
+        if start_match:
+            events.append(
+                _format_openclaw_tool_call(
+                    tool_name=start_match.group("tool"),
+                    tool_use_id=start_match.group("id"),
+                )
+            )
+            continue
+
+        end_match = tool_end_pattern.search(line)
+
+        if end_match:
+            events.append(
+                _format_openclaw_tool_result(
+                    tool_name=end_match.group("tool"),
+                    tool_use_id=end_match.group("id"),
+                )
+            )
+            continue
+
+        if "incomplete turn detected:" in line:
+            events.append(
+                _trace_event(
+                    kind="summary",
+                    content=(
+                        "OpenClaw reported incomplete_turn after tool execution. "
+                        "This is treated as an adapter/UI completion policy issue "
+                        "when native clembench episode artifacts exist."
+                    ),
+                )
+            )
+
+    return events
+
+
+def _parse_openclaw_trace(text: str) -> list[dict[str, Any]]:
+    if (
+        "openclaw_agent_command:" not in text
+        and "openclaw_agent_stdout:" not in text
+        and "openclaw_agent_stderr:" not in text
+    ):
+        return []
+
+    session_events = []
+
+    for line in text.splitlines():
+        session_events.extend(_parse_openclaw_session_json_line(line))
+
+    if session_events:
+        # Add the incomplete_turn marker from console logs if present, but use
+        # session JSONL for tool calls/results because it contains args/results.
+        if "incomplete turn detected:" in text:
+            session_events.append(
+                _trace_event(
+                    kind="summary",
+                    content=(
+                        "OpenClaw reported incomplete_turn after tool execution. "
+                        "This is treated as an adapter/UI completion policy issue "
+                        "when native clembench episode artifacts exist."
+                    ),
+                )
+            )
+
+        return session_events
+
+    return _parse_openclaw_console_trace(text)
+
+
+def parse_agent_trace(trace_path: Path) -> list[dict[str, Any]]:
+    trace_text = trace_path.read_text(encoding="utf-8", errors="replace")
+
+    hermes_events = _parse_hermes_trace(trace_text)
+
+    if hermes_events:
+        return _repair_hermes_trace_events(hermes_events, trace_text)
+
+    openclaw_events = _normalize_trace_events_for_render(
+        _parse_openclaw_trace(trace_text) + _parse_codex_trace(trace_text)
+    )
+
+    if openclaw_events:
+        return openclaw_events
+
+    events = []
+
+    for line in trace_text.splitlines():
         line = line.rstrip()
 
         if not line:
@@ -372,6 +954,367 @@ def parse_agent_trace(trace_path: Path) -> list[dict[str, Any]]:
 
 def _html_message(content: str) -> str:
     return html.escape(content).replace("\n", "<br/>")
+
+
+
+def _parse_codex_trace(text: str) -> list[dict[str, Any]]:
+    """Parse Codex `codex exec --json` events from agent_trace.log.
+
+    Codex emits JSONL under a `codex_stdout_jsonl:` marker. We convert MCP
+    calls and command executions into the same generic tool transcript events
+    used by the renderer.
+    """
+    if "codex_stdout_jsonl:" not in text:
+        return []
+
+    block = text.split("codex_stdout_jsonl:", 1)[1]
+    if "\ncodex_stderr:" in block:
+        block = block.split("\ncodex_stderr:", 1)[0]
+    if "\nsuccess:" in block:
+        block = block.split("\nsuccess:", 1)[0]
+
+    events: list[dict[str, Any]] = []
+
+    for raw in block.splitlines():
+        raw = raw.strip()
+        if not raw.startswith("{"):
+            continue
+
+        try:
+            event = json.loads(raw)
+        except Exception:
+            continue
+
+        item = event.get("item") or {}
+        item_type = item.get("type")
+        event_type = event.get("type")
+
+        if event_type == "turn.completed":
+            usage = event.get("usage") or {}
+            if usage:
+                events.append({
+                    "kind": "agent_message",
+                    "text": "Codex usage: " + json.dumps(usage, ensure_ascii=False),
+                })
+            continue
+
+        if item_type == "agent_message":
+            txt = item.get("text") or ""
+            if txt.strip():
+                events.append({
+                    "kind": "agent_message",
+                    "text": txt,
+                })
+            continue
+
+        if item_type == "reasoning":
+            txt = item.get("text") or item.get("summary") or item.get("content") or ""
+            if isinstance(txt, list):
+                txt = "\n".join(str(x) for x in txt)
+            if str(txt).strip():
+                events.append({
+                    "kind": "agent_reasoning",
+                    "text": str(txt),
+                })
+            continue
+
+        if item_type == "mcp_tool_call":
+            tool = item.get("tool")
+            server = item.get("server")
+            name = f"{server}__{tool}" if server and tool else tool or "mcp_tool_call"
+            canonical = _canonical_tool_name(name)
+
+            args = item.get("arguments") or {}
+            status = item.get("status")
+
+            if event_type == "item.started":
+                events.append({
+                    "kind": "agent_tool_use",
+                    "tool_name": canonical,
+                    "tool_input": args,
+                    "tool_use_id": item.get("id"),
+                })
+
+            elif event_type == "item.completed":
+                result = item.get("result")
+                error = item.get("error")
+                events.append({
+                    "kind": "agent_tool_result",
+                    "tool_name": canonical,
+                    "tool_use_id": item.get("id"),
+                    "is_error": bool(error) or status == "failed",
+                    "tool_result": error if error is not None else result,
+                })
+            continue
+
+        if item_type == "command_execution":
+            command = item.get("command") or ""
+            if event_type == "item.started":
+                events.append({
+                    "kind": "agent_tool_use",
+                    "tool_name": "command_execution",
+                    "tool_input": {"command": command},
+                    "tool_use_id": item.get("id"),
+                })
+
+            elif event_type == "item.completed":
+                out = item.get("aggregated_output")
+                exit_code = item.get("exit_code")
+                status = item.get("status")
+                events.append({
+                    "kind": "agent_tool_result",
+                    "tool_name": "command_execution",
+                    "tool_use_id": item.get("id"),
+                    "is_error": bool(exit_code not in (0, None)),
+                    "tool_result": {
+                        "exit_code": exit_code,
+                        "status": status,
+                        "output": out,
+                    },
+                })
+            continue
+
+    return events
+
+
+
+def _compact_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(value)
+
+
+def _normalize_trace_events_for_render(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Make parsed harness events match the transcript renderer schema.
+
+    Renderer expects:
+      kind: reasoning | tool-use | tool-result | summary | ...
+      content: string
+
+    Codex parser initially keeps structured fields, so normalize them here while
+    preserving tool_name/tool_use_id/tool_input/tool_result for alignment logic.
+    """
+    normalized: list[dict[str, Any]] = []
+
+    for event in events:
+        if "content" in event and event.get("kind") not in {
+            "agent_tool_use",
+            "agent_tool_result",
+            "agent_reasoning",
+            "agent_message",
+        }:
+            normalized.append(event)
+            continue
+
+        event = dict(event)
+        kind = event.get("kind")
+
+        if kind == "agent_tool_use":
+            tool_name = event.get("tool_name") or "tool"
+            tool_input = event.get("tool_input")
+            event["kind"] = "tool-use"
+            event["content"] = (
+                f"{tool_name}({_compact_json(tool_input)})\n"
+                f"tool_use_id: {event.get('tool_use_id')}"
+            )
+
+        elif kind == "agent_tool_result":
+            tool_name = event.get("tool_name") or "tool"
+            event["kind"] = "tool-result"
+            event["content"] = (
+                f"{tool_name}\n"
+                f"tool_use_id: {event.get('tool_use_id')}\n"
+                f"is_error: {event.get('is_error')}\n"
+                f"{_compact_json(event.get('tool_result'))}"
+            )
+
+        elif kind == "agent_reasoning":
+            event["kind"] = "reasoning"
+            event["content"] = str(event.get("text") or "")
+
+        elif kind == "agent_message":
+            event["kind"] = "summary"
+            event["content"] = str(event.get("text") or "")
+
+        normalized.append(event)
+
+    return normalized
+
+
+
+def _trace_event_tool_name(event: dict[str, Any]) -> str | None:
+    tool_name = event.get("tool_name")
+    if tool_name:
+        return tool_name
+
+    content = str(event.get("content", ""))
+    if content.startswith("mcp__clem-game__start_game"):
+        return "mcp__clem-game__start_game"
+    if content.startswith("mcp__clem-game__submit_response"):
+        return "mcp__clem-game__submit_response"
+    if content.startswith("mcp__clem-game__get_state"):
+        return "mcp__clem-game__get_state"
+    if content.startswith("execute_code"):
+        return "execute_code"
+    if content.startswith("command_execution"):
+        return "command_execution"
+
+    return None
+
+
+def _format_tool_call_content(tool_name: str, args: Any) -> str:
+    if isinstance(args, dict) and len(args) == 0:
+        return f"{tool_name}()"
+
+    if tool_name == "mcp__clem-game__submit_response" and isinstance(args, dict):
+        return f"{tool_name}(response={json.dumps(args.get('response'), ensure_ascii=False)})"
+
+    if tool_name == "mcp__clem-game__start_game" and isinstance(args, dict):
+        return f"{tool_name}({_compact_json(args)})" if args else f"{tool_name}()"
+
+    if tool_name == "execute_code" and isinstance(args, dict) and "code" in args:
+        code = str(args.get("code"))
+        if len(code) > 4000:
+            code = code[:4000] + "\n... [truncated]"
+        return f"{tool_name}(code={json.dumps(code, ensure_ascii=False)})"
+
+    return f"{tool_name}({_compact_json(args)})"
+
+
+def _extract_hermes_debug_tool_calls(trace_text: str) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+
+    for line in trace_text.splitlines():
+        if " - root - DEBUG " not in line or " - Tool call: " not in line or " with args: " not in line:
+            continue
+
+        part = line.split(" - Tool call: ", 1)[1]
+        tool_name, raw_args = part.split(" with args: ", 1)
+        tool_name = _canonical_tool_name(tool_name.strip())
+        raw_args = raw_args.strip()
+
+        # Hermes may append literal "..." when it truncates debug args.
+        if raw_args.endswith("..."):
+            raw_args = raw_args[:-3].rstrip()
+
+        args: Any
+        try:
+            args = json.loads(raw_args)
+        except Exception:
+            args = {"_raw_args": raw_args}
+
+        calls.append({
+            "tool_name": tool_name,
+            "args": args,
+        })
+
+    return calls
+
+
+def _repair_hermes_trace_events(events: list[dict[str, Any]], trace_text: str) -> list[dict[str, Any]]:
+    """Repair Hermes transcript events.
+
+    Hermes has two console representations:
+    - compact CLI lines like Tool 1: mcp_clem_game_submit_response(['response'])
+      which only contain argument names;
+    - DEBUG lines like Tool call: ... with args: {...}
+      which contain real argument values.
+
+    The previous parser often used the compact line and produced response=None.
+    This repair overlays DEBUG args where available and adds missing execute_code
+    tool-use bubbles before the corresponding raw result.
+    """
+    debug_calls = _extract_hermes_debug_tool_calls(trace_text)
+    debug_pos = 0
+    repaired: list[dict[str, Any]] = []
+    inserted_execute_code = False
+
+    for event in events:
+        event = dict(event)
+        kind = event.get("kind")
+        content = str(event.get("content", ""))
+        tool_name = _trace_event_tool_name(event)
+
+        # Fill missing tool_name for later alignment.
+        if tool_name and "tool_name" not in event:
+            event["tool_name"] = tool_name
+
+        # Repair lossy Hermes tool-use content using DEBUG call args.
+        if kind == "tool-use" and tool_name:
+            # Find next DEBUG call for same tool.
+            match = None
+            while debug_pos < len(debug_calls):
+                candidate = debug_calls[debug_pos]
+                debug_pos += 1
+                if candidate["tool_name"] == tool_name:
+                    match = candidate
+                    break
+
+            if match is not None:
+                event["tool_input"] = match["args"]
+                event["content"] = _format_tool_call_content(tool_name, match["args"])
+
+        # Hermes sometimes shows the execute_code result without the call bubble.
+        # Insert the missing call immediately before the first execute_code result.
+        if (
+            not inserted_execute_code
+            and kind in {"tool-result", "summary", "reasoning"}
+            and (
+                "CANDIDATES_COUNT" in content
+                or '"tool_calls_made": 1' in content
+                or "'tool_calls_made': 1" in content
+            )
+        ):
+            execute_call = next(
+                (c for c in debug_calls if c["tool_name"] == "execute_code"),
+                None,
+            )
+            if execute_call is not None:
+                repaired.append({
+                    "kind": "tool-use",
+                    "tool_name": "execute_code",
+                    "tool_input": execute_call["args"],
+                    "content": _format_tool_call_content("execute_code", execute_call["args"]),
+                })
+                inserted_execute_code = True
+
+        repaired.append(event)
+
+    return repaired
+
+
+def _fill_native_submit_response(events: list[dict[str, Any]], response: str) -> list[dict[str, Any]]:
+    """Use the native clembench response to repair Hermes response=None bubbles."""
+    out: list[dict[str, Any]] = []
+    filled = False
+
+    for event in events:
+        event = dict(event)
+        tool_name = _trace_event_tool_name(event)
+
+        if (
+            not filled
+            and event.get("kind") == "tool-use"
+            and tool_name == "mcp__clem-game__submit_response"
+        ):
+            content = str(event.get("content", ""))
+            tool_input = event.get("tool_input")
+
+            if (
+                "response=None" in content
+                or not isinstance(tool_input, dict)
+                or tool_input.get("response") in {None, ""}
+                or "_raw_args" in tool_input
+            ):
+                event["tool_name"] = tool_name
+                event["tool_input"] = {"response": response}
+                event["content"] = _format_tool_call_content(tool_name, {"response": response})
+                filled = True
+
+        out.append(event)
+
+    return out
 
 
 def _render_bubble(speaker_attr: str,
@@ -442,19 +1385,79 @@ def _render_trace_events(events: list[dict[str, Any]],
 def _find_next_submit_index(events: list[dict[str, Any]],
                             start_index: int,
                             response: str) -> int | None:
+    """Find the trace span ending at the submit_response result for this native response.
+
+    Hermes sometimes logs only response=null / response=None because the real
+    DEBUG args are truncated. In that case, repair the trace event from the
+    native clembench response while aligning.
+    """
+    def repair_event_with_native_response(event: dict[str, Any]) -> None:
+        event["tool_name"] = "mcp__clem-game__submit_response"
+        event["tool_input"] = {"response": response}
+        event["content"] = _format_tool_call_content(
+            "mcp__clem-game__submit_response",
+            {"response": response},
+        )
+
+    def matches_response(event: dict[str, Any]) -> bool:
+        if _trace_event_tool_name(event) != "mcp__clem-game__submit_response":
+            return False
+
+        tool_input = event.get("tool_input")
+        if isinstance(tool_input, dict) and tool_input.get("response") == response:
+            return True
+
+        content = str(event.get("content", ""))
+
+        if response in content:
+            return True
+
+        try:
+            escaped = json.dumps(response, ensure_ascii=False)[1:-1]
+            if escaped in content:
+                return True
+        except Exception:
+            pass
+
+        # Hermes fallback: align the next lossy submit bubble with the next
+        # native player response, then repair the bubble before rendering.
+        if (
+            "response=None" in content
+            or "response=null" in content
+            or "response=None" in str(tool_input)
+            or "response': None" in str(tool_input)
+            or '"response": null' in str(tool_input)
+            or "_raw_args" in str(tool_input)
+        ):
+            repair_event_with_native_response(event)
+            return True
+
+        return False
+
     for index in range(start_index, len(events)):
         event = events[index]
 
-        if event["kind"] != "tool-use":
+        if event.get("kind") != "tool-use":
             continue
 
-        if event.get("tool_name") != "mcp__clem-game__submit_response":
+        if not matches_response(event):
             continue
 
-        if event.get("response") == response:
-            return index
+        tool_use_id = event.get("tool_use_id")
+
+        for result_index in range(index + 1, len(events)):
+            result_event = events[result_index]
+            if result_event.get("kind") != "tool-result":
+                continue
+            if _trace_event_tool_name(result_event) != "mcp__clem-game__submit_response":
+                continue
+            if tool_use_id is None or result_event.get("tool_use_id") == tool_use_id:
+                return result_index
+
+        return index
 
     return None
+
 
 
 def build_transcript_with_tools(interactions: dict[str, Any],
@@ -539,8 +1542,12 @@ def build_transcript_with_tools(interactions: dict[str, Any],
                 submit_index = _find_next_submit_index(trace_events, trace_index, response)
 
                 if submit_index is not None:
-                    transcript += _render_trace_events(
+                    trace_span = _fill_native_submit_response(
                         trace_events[trace_index:submit_index + 1],
+                        response,
+                    )
+                    transcript += _render_trace_events(
+                        trace_span,
                         external_player,
                         players,
                         css_player_dict,

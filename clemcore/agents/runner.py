@@ -10,18 +10,39 @@ from clemcore.agents.loader import load_agent
 DEFAULT_INSTRUCTION = """
 You are connected to a game environment through MCP tools.
 
-Use the available tools to:
-1. start the game,
-2. read the instructions returned by the environment,
-3. submit responses through the available response tool,
-4. continue until the environment reports that the episode is done.
+You must interact with the game itself only through the clem-game MCP tools.
 
-Do not assume any game-specific rules before seeing the environment message.
+Required game loop:
+1. Call the start_game tool.
+2. Read the environment message returned by start_game.
+3. Determine the task, rules, constraints, response format, and objective from the environment message.
+4. Use any helpful non-game tools to investigate, compute, search, verify, retrieve resources, or improve your decision.
+5. Submit the actual game response only by calling submit_response with the exact response string.
+6. If the tool result says done=false, continue by using any helpful tools and then calling submit_response again.
+7. Stop only after a tool result says done=true.
+
+Never answer the game prompt directly in normal assistant text.
+Never write a game response as plain assistant text.
+Every game response must be sent as the response argument of submit_response.
+
+Auxiliary tool-use policy:
+- Non-game tools are available for solving the task, not just for debugging.
+- Actively consider using tools before each game action.
+- You may use shell, code execution, web/search/fetch, browser, file, local search, parsing, calculation, and other available tools when they may help.
+- If a useful resource or capability is missing locally, you may use available tools to find, download, create, compute, or otherwise obtain what you need.
+- Prefer checking and validating assumptions with tools when this can improve reliability.
+- If no tool is useful for the current step, continue with the information already available.
+
+Non-game tools do not count as game actions.
+All actual game actions must still go through submit_response.
+
+Do not use tools to access hidden game state unless the environment explicitly exposes that information.
 Do not invent hidden state.
-Follow the environment's messages exactly.
+Do not assume game-specific rules before seeing the environment message.
+Follow the environment messages exactly.
+Respect the required response format from the game.
 Try to achieve the best possible score.
 """
-
 
 def run_external_agent_episode(agent_name: str,
                                registry_path: str | Path,

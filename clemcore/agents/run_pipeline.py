@@ -1,9 +1,12 @@
 import argparse
 import json
+import re
 import socket
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
+from itertools import islice
 from multiprocessing import Process
 from pathlib import Path
 
@@ -11,6 +14,8 @@ from clemcore.clemgame.instances import GameInstances
 from clemcore.clemgame.registry import GameRegistry
 
 from clemcore.agents.mcp.server import run_clem_mcp_server
+from clemcore.agents.model_connection import resolve_agent_model_connection
+from clemcore.agents.mcp.bridge import OpenEnvMCPClient
 
 
 CLEMCORE_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +26,10 @@ ENV_FILE = SANDBOX_DIR / ".env"
 DOCKER_IMAGE = "clem-agent-sandbox:dev"
 SERVER_PORT = 8001
 OPENENV_MCP_URL = f"http://host.docker.internal:{SERVER_PORT}/mcp"
+HOST_OPENENV_MCP_URL = f"http://127.0.0.1:{SERVER_PORT}/mcp"
+CONTROL_FAILURE_RESPONSE = (
+    "CLEM_AGENT_CONTROL_ERROR: external harness ended before completing the game"
+)
 
 
 def _load_game_instances(game_name: str,
@@ -43,14 +52,61 @@ def _load_game_instances(game_name: str,
     return game_instances
 
 
+def _player_ids_from_clemgame(game_name: str) -> list[str] | None:
+    """Return player ids declared by the game's clemgame.json, if available."""
+    metadata_path = Path.cwd() / game_name / "clemgame.json"
+    if not metadata_path.exists():
+        return None
+
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    specs: list[dict] = []
+    if isinstance(data, list):
+        specs = [item for item in data if isinstance(item, dict)]
+    elif isinstance(data, dict):
+        if data.get("name") == game_name or data.get("game_name") == game_name:
+            specs.append(data)
+        for key in ("games", "game_specs", "benchmarks"):
+            value = data.get(key)
+            if isinstance(value, list):
+                specs.extend(item for item in value if isinstance(item, dict))
+
+    for spec in specs:
+        if spec.get("name") != game_name and spec.get("game_name") != game_name:
+            continue
+
+        player_count = (
+            spec.get("players")
+            or spec.get("num_players")
+            or spec.get("n_players")
+            or spec.get("number_of_players")
+        )
+
+        if isinstance(player_count, int):
+            return [f"player_{index}" for index in range(player_count)]
+
+        roles = spec.get("roles")
+        if isinstance(roles, list):
+            return [f"player_{index}" for index in range(len(roles))]
+
+    return None
+
+
 def _env_agents_from_models(models: list[str],
-                            learner_agent: str) -> dict[str, str]:
-    number_of_players = len(models) + 1
-    player_ids = [f"player_{index}" for index in range(number_of_players)]
+                            learner_agent: str,
+                            game_name: str | None = None) -> dict[str, str]:
+    if game_name is not None:
+        player_ids = _player_ids_from_clemgame(game_name)
+    else:
+        player_ids = None
+
+    if player_ids is None:
+        number_of_players = len(models) + 1
+        player_ids = [f"player_{index}" for index in range(number_of_players)]
 
     if learner_agent not in player_ids:
         raise ValueError(
-            f"Cannot use learner_agent={learner_agent!r} with {len(models)} native model(s). "
+            f"Cannot use learner_agent={learner_agent!r}. "
             f"Valid choices are: {player_ids}"
         )
 
@@ -60,10 +116,17 @@ def _env_agents_from_models(models: list[str],
         if player_id != learner_agent
     ]
 
+    if len(models) < len(env_player_ids):
+        raise ValueError(
+            f"Need {len(env_player_ids)} native model(s) for non-agent players "
+            f"{env_player_ids}, but got {len(models)}: {models}"
+        )
+
     return {
         player_id: model
         for player_id, model in zip(env_player_ids, models)
     }
+
 
 
 def _port_is_open(host: str, port: int) -> bool:
@@ -108,6 +171,7 @@ def _serve(game_name: str,
         env_agents=_env_agents_from_models(
             models=env_agent_models,
             learner_agent=agent_player,
+            game_name=game_name,
         ),
         game_instance_split=None,
         instances_filename=instances_filename,
@@ -222,10 +286,26 @@ def _write_agent_trace(results_dir: str,
         ]
 
         if not matching_episode_dirs:
-            raise RuntimeError(
-                "Docker episode completed, but no matching episode directory was found for "
-                f"game={game_name}, experiment={experiment_name}, game_id={game_id}."
+            failure_dir = (
+                Path(results_dir)
+                / "_agent_failures"
+                / game_name
+                / experiment_name
+                / f"game_id_{game_id}"
+                / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             )
+            failure_dir.mkdir(parents=True, exist_ok=True)
+
+            trace_path = failure_dir / "agent_trace.log"
+            trace_path.write_text(trace_text, encoding="utf-8")
+
+            meta_path = failure_dir / "agent_trace_meta.json"
+            meta_path.write_text(
+                json.dumps(metadata, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            return trace_path
 
         episode_dir = max(matching_episode_dirs, key=_episode_dir_timestamp)
 
@@ -242,7 +322,10 @@ def _write_agent_trace(results_dir: str,
 
 
 def _run_docker_episode(experiment_name: str,
-                        game_id: int | str) -> tuple[str, int]:
+                        game_id: int | str,
+                        agent_name: str,
+                        model_connection_path: Path | None = None,
+                        shared_state_dir: Path | None = None) -> tuple[str, int]:
     if not ENV_FILE.exists():
         raise FileNotFoundError(f"Missing Docker env file: {ENV_FILE}")
 
@@ -255,11 +338,31 @@ def _run_docker_episode(experiment_name: str,
         "-e", f"OPENENV_MCP_URL={OPENENV_MCP_URL}",
         "-e", f"CLEM_EXPERIMENT_NAME={experiment_name}",
         "-e", f"CLEM_GAME_ID={game_id}",
+        "-e", f"CLEM_AGENT_NAME={agent_name}",
         "-v", f"{CLEMCORE_ROOT}:/opt/clemcore:ro",
         "-v", f"{SANDBOX_DIR}:/app:ro",
+    ]
+
+    if shared_state_dir is not None:
+        command.extend([
+            "-e", "CLEM_OPENENV_SESSION_PATH=/run/clem-agent/openenv_session.json",
+            "-v", f"{shared_state_dir}:/run/clem-agent:rw",
+        ])
+
+    if model_connection_path is not None:
+        command.extend([
+            "-e", "CLEM_AGENT_MODEL_CONNECTION_PATH=/run/clem-agent/model_connection.json",
+        ])
+
+        if shared_state_dir is None:
+            command.extend([
+                "-v", f"{model_connection_path}:/run/clem-agent/model_connection.json:ro",
+            ])
+
+    command.extend([
         DOCKER_IMAGE,
         "python", "/app/run_agent_container.py",
-    ]
+    ])
 
     process = subprocess.Popen(
         command,
@@ -288,6 +391,87 @@ def _run_docker_episode(experiment_name: str,
         )
 
     return trace_text, return_code
+
+
+
+def _cleanup_openenv_session_from_file(session_path: Path,
+                                       trace_text: str) -> None:
+    if not session_path.exists():
+        return
+
+    try:
+        session_data = json.loads(session_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        print(f"openenv_session_file_invalid: path={session_path} error={error}")
+        return
+
+    session_id = session_data.get("session_id")
+
+    if not session_id:
+        return
+
+    completed = (
+        '"done":true' in trace_text
+        or '"done": true' in trace_text
+        or "'done': True" in trace_text
+    )
+
+    client = OpenEnvMCPClient(HOST_OPENENV_MCP_URL)
+    client.session_id = session_id
+
+    if completed:
+        return
+
+    try:
+        result = client.call_tool(
+            "submit_response",
+            {"response": CONTROL_FAILURE_RESPONSE},
+        )
+        print(
+            "openenv_control_failure_submitted: "
+            f"session_id={session_id} done={result.get('done')}"
+        )
+
+    except Exception as error:
+        print(
+            "openenv_control_failure_failed: "
+            f"session_id={session_id} error={error}"
+        )
+
+    try:
+        client.close_session()
+        print(f"openenv_session_closed: {session_id}")
+
+    except Exception as error:
+        print(f"openenv_session_close_failed: session_id={session_id} error={error}")
+
+
+def _write_agent_model_connection(agent_name: str,
+                                  output_dir: Path) -> Path | None:
+    connection = resolve_agent_model_connection(
+        agent_name=agent_name,
+        registry_path=REGISTRY_PATH,
+    )
+
+    if connection is None:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "model_connection.json"
+    output_path.write_text(
+        json.dumps(connection, indent=2),
+        encoding="utf-8",
+    )
+    output_path.chmod(0o600)
+
+    print(
+        "agent_model_connection: "
+        f"clem_model={connection.get('clem_model')} "
+        f"backend={connection.get('backend')} "
+        f"runtime_model={connection.get('model')}"
+    )
+
+    return output_path
 
 
 def main() -> None:
@@ -322,12 +506,17 @@ def main() -> None:
                         "--results_dir",
                         default="results/external-agents",
                         help="Results root directory, matching clem run -r style.")
+    parser.add_argument("--max-instances",
+                        type=int,
+                        default=None,
+                        help="Optional debugging limit for number of selected instances to run.")
 
     args = parser.parse_args()
 
     env_agents = _env_agents_from_models(
         models=args.models,
         learner_agent=args.agent_player,
+        game_name=args.game,
     )
 
     game_instances = _load_game_instances(
@@ -351,6 +540,12 @@ def main() -> None:
     print(f"results_dir: {args.results_dir}")
     print(game_instances.describe())
 
+    temp_dir = tempfile.TemporaryDirectory(prefix="clem-agent-model-")
+    model_connection_path = _write_agent_model_connection(
+        agent_name=args.agent,
+        output_dir=Path(temp_dir.name),
+    )
+
     server_process = _start_server(
         game_name=args.game,
         agent_name=args.agent,
@@ -361,7 +556,13 @@ def main() -> None:
     )
 
     try:
-        for index, row in enumerate(game_instances, start=1):
+        selected_instances = game_instances
+
+        if args.max_instances is not None:
+            selected_instances = list(islice(game_instances, args.max_instances))
+            total = len(selected_instances)
+
+        for index, row in enumerate(selected_instances, start=1):
             experiment = row["experiment"]
             game_instance = row["game_instance"]
 
@@ -379,10 +580,19 @@ def main() -> None:
             )
 
             started_at = datetime.now(timezone.utc)
+            openenv_session_path = Path(temp_dir.name) / "openenv_session.json"
+
+            if openenv_session_path.exists():
+                openenv_session_path.unlink()
+
             trace_text, return_code = _run_docker_episode(
                 experiment_name=experiment_name,
                 game_id=game_id,
+                agent_name=args.agent,
+                model_connection_path=model_connection_path,
+                shared_state_dir=Path(temp_dir.name),
             )
+            _cleanup_openenv_session_from_file(openenv_session_path, trace_text)
             finished_at = datetime.now(timezone.utc)
 
             trace_path = _write_agent_trace(
@@ -412,6 +622,7 @@ def main() -> None:
 
     finally:
         _stop_server(server_process)
+        temp_dir.cleanup()
 
 
 if __name__ == "__main__":

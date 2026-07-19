@@ -3,17 +3,24 @@ from pathlib import Path
 from typing import Any
 
 from clemcore.agents.adapters.claude_code import ClaudeCodeHarness
+from clemcore.agents.adapters.codex import CodexHarness
+from clemcore.agents.adapters.hermes import HermesHarness
 from clemcore.agents.adapters.manual_mcp import ExternalMCPHarness
+from clemcore.agents.adapters.openclaw import OpenClawHarness
 
 # dictionary storing all 'adapters' to the specific agent harnesses which are currently supported
 BACKENDS = {
     "manual_mcp": ExternalMCPHarness,
     "claude_code": ClaudeCodeHarness,
+    "codex": CodexHarness,
+    "hermes": HermesHarness,
+    "openclaw": OpenClawHarness,
 }
 
 
 def load_agent(agent_name: str,
                registry_path: str | Path) -> Any:
+
     registry_path = Path(registry_path).expanduser()
 
     with open(registry_path, "r", encoding="utf-8") as f:
