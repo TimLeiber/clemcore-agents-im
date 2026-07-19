@@ -19,6 +19,7 @@ REGISTRY_PATH = SANDBOX_DIR / "agent_registry.json"
 ENV_FILE = SANDBOX_DIR / ".env"
 
 DOCKER_IMAGE = "clem-agent-sandbox:dev"
+# convention i set on the PORT of the MCP server
 SERVER_PORT = 8001
 OPENENV_MCP_URL = f"http://host.docker.internal:{SERVER_PORT}/mcp"
 HOST_OPENENV_MCP_URL = f"http://127.0.0.1:{SERVER_PORT}/mcp"
@@ -123,87 +124,73 @@ def _env_agents_from_models(models: list[str],
     }
 
 
+def start_server(
+    game_name: str,
+    agent_name: str,
+    agent_player: str,
+    env_agent_models: list[str],
+    instances_filename: str | None,
+    results_dir: str,
+) -> Process:
+    """Start the clembench MCP server and wait until it is ready."""
 
-def _port_is_open(host: str, port: int) -> bool:
+    # ensure that another server is not already using the configured port
+    # should not happen anymore after pipeline automatically closes server
     try:
-        with socket.create_connection((host, port), timeout=1):
-            return True
+        with socket.create_connection(("127.0.0.1", SERVER_PORT), timeout=1):
+            raise RuntimeError(
+                f"Port {SERVER_PORT} is already in use. "
+                "Stop the existing MCP server before running the pipeline."
+            )
     except OSError:
-        return False
+        pass
 
-
-def _ensure_port_free(port: int) -> None:
-    if _port_is_open("127.0.0.1", port):
-        raise RuntimeError(
-            f"Port {port} is already in use. Stop the existing MCP server before running the pipeline."
-        )
-
-
-def _wait_for_server(port: int, timeout_s: float = 30.0) -> None:
-    deadline = time.monotonic() + timeout_s
-
-    while time.monotonic() < deadline:
-        if _port_is_open("127.0.0.1", port):
-            return
-
-        time.sleep(0.25)
-
-    raise TimeoutError(f"MCP server did not become available on port {port}.")
-
-
-def _serve(game_name: str,
-           agent_name: str,
-           agent_player: str,
-           env_agent_models: list[str],
-           instances_filename: str | None,
-           results_dir: str,
-           port: int) -> None:
-    run_clem_mcp_server(
-        game_name=game_name,
-        agent_name=agent_name,
-        registry_path=REGISTRY_PATH,
-        learner_agent=agent_player,
-        env_agents=_env_agents_from_models(
-            models=env_agent_models,
-            learner_agent=agent_player,
-            game_name=game_name,
-        ),
-        game_instance_split=None,
-        instances_filename=instances_filename,
-        single_pass=False,
-        results_dir=results_dir,
-        port=port,
-    )
-
-
-def _start_server(game_name: str,
-                  agent_name: str,
-                  agent_player: str,
-                  env_agent_models: list[str],
-                  instances_filename: str | None,
-                  results_dir: str) -> Process:
-    _ensure_port_free(SERVER_PORT)
-
+    # start the MCP server in a separate process
     process = Process(
-        target=_serve,
-        kwargs=dict(
-            game_name=game_name,
-            agent_name=agent_name,
-            agent_player=agent_player,
-            env_agent_models=env_agent_models,
-            instances_filename=instances_filename,
-            results_dir=results_dir,
-            port=SERVER_PORT,
-        ),
+        target=run_clem_mcp_server,
+        kwargs={
+            "game_name": game_name,
+            "agent_name": agent_name,
+            "registry_path": REGISTRY_PATH,
+            "learner_agent": agent_player,
+            "env_agents": _env_agents_from_models(
+                models=env_agent_models,
+                learner_agent=agent_player,
+                game_name=game_name,
+            ),
+            "game_instance_split": None,
+            "instances_filename": instances_filename,
+            "single_pass": False,
+            "results_dir": results_dir,
+            "port": SERVER_PORT,
+        },
     )
+    # start the process
     process.start()
 
-    _wait_for_server(SERVER_PORT)
+    # wait until the server accepts connections.
+    deadline = time.monotonic() + 30
 
-    if not process.is_alive():
-        raise RuntimeError("MCP server process exited during startup.")
+    while time.monotonic() < deadline:
+        if not process.is_alive():
+            raise RuntimeError("MCP server process exited during startup.")
 
-    return process
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", SERVER_PORT),
+                timeout=1,
+            ):
+                return process
+        except OSError:
+            time.sleep(0.25)
+
+    # Stop the process when startup fails
+    process.terminate()
+    process.join(timeout=5)
+
+    raise TimeoutError(
+        f"MCP server did not become available on port {SERVER_PORT}."
+    )
 
 
 def _stop_server(process: Process) -> None:

@@ -12,7 +12,7 @@ from .utils import (
     _episode_dirs,
     _load_game_instances,
     _run_docker_episode,
-    _start_server,
+    start_server, # function starts the MCP server with tools to play game and waits until server is ready.
     _stop_server,
     _write_agent_model_connection,
     _write_agent_trace,
