@@ -28,22 +28,37 @@ CONTROL_FAILURE_RESPONSE = (
 )
 
 
-def _load_game_instances(game_name: str,
-                         instances_filename: str | None,
-                         experiment_name: str | None) -> GameInstances:
+def load_game_instances(game_name: str,
+                        instances_filename: str | None = None,
+                        experiment_name: str | None = None) -> GameInstances:
+
+    """Load game instances and optionally restrict them to one experiment.
+
+    Args:
+        game_name: Name of the game whose instances should be loaded.
+        instances_filename: Optional alternative instances filename.
+        experiment_name: Optional experiment name used to filter the instances.
+
+    Returns:
+        The loaded and optionally filtered game instances.
+    """
+
+    # load the game definition from the clembench registry.
     game_registry = GameRegistry.from_directories_and_cwd_files()
     game_spec = game_registry.get_game_spec(game_name)
 
+    # use a custom instances file when one was provided.
     if instances_filename:
         game_spec.instances = instances_filename
 
-    experiment_filter = None
-
-    if experiment_name:
-        experiment_filter = lambda row: row["experiment"]["name"] == experiment_name
-
+    # load all instances defined by the game specification.
     game_instances = GameInstances.from_game_spec(game_spec)
-    game_instances = game_instances.filter(experiment_filter)
+
+    # Restrict the run to one experiment when requested.
+    if experiment_name:
+        game_instances = game_instances.filter(
+            lambda row: row["experiment"]["name"] == experiment_name
+        )
 
     return game_instances
 

@@ -10,7 +10,7 @@ from .utils import (
     _cleanup_openenv_session_from_file,
     _env_agents_from_models,
     _episode_dirs,
-    _load_game_instances,
+    load_game_instances,
     _run_docker_episode,
     start_server, # function starts the MCP server with tools to play game and waits until server is ready.
     _stop_server,
@@ -64,7 +64,7 @@ def main() -> None:
         game_name=args.game,
     )
 
-    game_instances = _load_game_instances(
+    game_instances = load_game_instances(
         game_name=args.game,
         instances_filename=args.instances_filename,
         experiment_name=args.experiment_name,
@@ -91,7 +91,7 @@ def main() -> None:
         output_dir=Path(temp_dir.name),
     )
 
-    server_process = _start_server(
+    server_process = start_server(
         game_name=args.game,
         agent_name=args.agent,
         agent_player=args.agent_player,
