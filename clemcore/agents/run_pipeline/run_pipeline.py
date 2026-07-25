@@ -6,23 +6,24 @@ from pathlib import Path
 
 # import all functions from utils needed to run main
 from .utils import (
-    DOCKER_IMAGE,
-    _cleanup_openenv_session_from_file,
-    _env_agents_from_models,
-    _episode_dirs,
-    load_game_instances,
-    _run_docker_episode,
-    start_server, # function starts the MCP server with tools to play game and waits until server is ready.
-    _stop_server,
-    _write_agent_model_connection,
-    _write_agent_trace,
+    DOCKER_IMAGE, # Docker image used for agent episodes
+    _env_agents_from_models, # map native models to player slots
+    _write_agent_model_connection, # write the agent model configuration
+
+    load_game_instances, # load and filter game instances
+    run_docker_episode, # run one agent episode in Docker
+    start_server, # start the MCP server
+    write_agent_trace # store the captured agent trace
 )
 
 
 def main() -> None:
+    # define the command line interface
     parser = argparse.ArgumentParser(
         description="Run external agent harnesses through clembench/OpenEnv/MCP.",
     )
+
+    # define the pipeline arguments
     parser.add_argument("-g",
                         "--game",
                         required=True,
@@ -56,25 +57,31 @@ def main() -> None:
                         default=None,
                         help="Optional debugging limit for number of selected instances to run.")
 
+    # parse the command line arguments
     args = parser.parse_args()
 
+    # map native models to non-agent player slots
     env_agents = _env_agents_from_models(
         models=args.models,
         learner_agent=args.agent_player,
         game_name=args.game,
     )
 
+    # ----- main step 1 -----
+    # load and filter the selected game instances
     game_instances = load_game_instances(
         game_name=args.game,
         instances_filename=args.instances_filename,
         experiment_name=args.experiment_name,
     )
 
+    # ensure that at least one instance was selected
     total = len(game_instances)
 
     if total == 0:
         raise RuntimeError("No game instances selected.")
 
+    # print the resolved pipeline configuration
     print(f"game: {args.game}")
     print(f"agent: {args.agent}")
     print(f"agent_player: {args.agent_player}")
@@ -85,12 +92,16 @@ def main() -> None:
     print(f"results_dir: {args.results_dir}")
     print(game_instances.describe())
 
+    # create temporary shared storage for the agent runtime
     temp_dir = tempfile.TemporaryDirectory(prefix="clem-agent-model-")
+    # resolve and write the external agent model connection
     model_connection_path = _write_agent_model_connection(
         agent_name=args.agent,
         output_dir=Path(temp_dir.name),
     )
 
+    # ---- main step 2 -----
+    # start the MCP game server, exposing game as tools for the agent
     server_process = start_server(
         game_name=args.game,
         agent_name=args.agent,
@@ -100,13 +111,16 @@ def main() -> None:
         results_dir=args.results_dir,
     )
 
+    # try block attempts to run external agent in docker container on each episode
     try:
+        # apply the optional debugging instance limit
         selected_instances = game_instances
 
         if args.max_instances is not None:
             selected_instances = list(islice(game_instances, args.max_instances))
             total = len(selected_instances)
 
+        # run each selected game instance
         for index, row in enumerate(selected_instances, start=1):
             experiment = row["experiment"]
             game_instance = row["game_instance"]
@@ -118,29 +132,32 @@ def main() -> None:
             print()
             print(f"[{index}/{total}] {experiment_name} / game_id={game_id} / target={target}")
 
-            before_episode_dirs = _episode_dirs(
-                results_dir=args.results_dir,
-                game_name=args.game,
-                experiment_name=experiment_name,
-            )
+            # record the episode directories that exist before this run
+            before_episode_dirs = {path
+                                   for path in Path(args.results_dir).glob(f"*/{args.game}/{experiment_name}/episode_*")
+                                   if path.is_dir()}
 
+            # record start time and remove session file from previous episode
             started_at = datetime.now(timezone.utc)
             openenv_session_path = Path(temp_dir.name) / "openenv_session.json"
 
             if openenv_session_path.exists():
                 openenv_session_path.unlink()
 
-            trace_text, return_code = _run_docker_episode(
+            # ----- main step 3 -----
+            # run the external agent inside Docker
+            trace_text, return_code = run_docker_episode(
                 experiment_name=experiment_name,
                 game_id=game_id,
                 agent_name=args.agent,
                 model_connection_path=model_connection_path,
                 shared_state_dir=Path(temp_dir.name),
             )
-            _cleanup_openenv_session_from_file(openenv_session_path, trace_text)
             finished_at = datetime.now(timezone.utc)
 
-            trace_path = _write_agent_trace(
+            # ----- main step 4 -----
+            # write the captured trace and metadata
+            trace_path = write_agent_trace(
                 results_dir=args.results_dir,
                 game_name=args.game,
                 experiment_name=experiment_name,
@@ -165,8 +182,19 @@ def main() -> None:
 
             print(f"agent_trace: {trace_path}")
 
+
     finally:
-        _stop_server(server_process)
+
+        # stop the MCP server
+        if server_process.is_alive():
+            server_process.terminate()
+            server_process.join(timeout=5)
+
+        # fallback to kill server process if process fails to exit initially
+        if server_process.is_alive():
+            server_process.kill()
+            server_process.join(timeout=5)
+
         temp_dir.cleanup()
 
 
