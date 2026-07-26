@@ -520,34 +520,38 @@ def _env_agents_from_models(models: list[str],
 
     return dict(zip(env_player_ids, models))
 
-
-
-
-
-
 def _write_agent_model_connection(agent_name: str,
                                   output_dir: Path) -> Path | None:
-    connection = resolve_agent_model_connection(
-        agent_name=agent_name,
-        registry_path=REGISTRY_PATH,
-    )
+    """Resolve and write the model connection required by an external agent.
 
+    Args:
+        agent_name: name of the external agent from the agent registry
+        output_dir: directory where the connection file should be written
+
+    Returns:
+        path to the written model connection file, or None when the agent
+        does not use a clemcore model connection
+    """
+
+    # resolve the clemcore model used by the external agent
+    connection = resolve_agent_model_connection(agent_name=agent_name, registry_path=REGISTRY_PATH)
+
+    # agents without an associated clemcore model need no connection file
     if connection is None:
         return None
 
+    # write the connection into the temporary directory shared with the container
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "model_connection.json"
-    output_path.write_text(
-        json.dumps(connection, indent=2),
-        encoding="utf-8",
-    )
+    output_path.write_text(json.dumps(connection, indent=2), encoding="utf-8")
+
+    # restrict access because the connection may contain credentials
     output_path.chmod(0o600)
 
-    print(
-        "agent_model_connection: "
-        f"clem_model={connection.get('clem_model')} "
-        f"backend={connection.get('backend')} "
-        f"runtime_model={connection.get('model')}"
-    )
+    # print the resolved connection without exposing sensitive values
+    print("agent_model_connection: "
+          f"clem_model={connection.get('clem_model')} "
+          f"backend={connection.get('backend')} "
+          f"runtime_model={connection.get('model')}")
 
     return output_path
