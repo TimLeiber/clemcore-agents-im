@@ -2,6 +2,7 @@ import json
 import socket
 import subprocess
 import time
+import os
 from datetime import datetime, timezone
 from multiprocessing import Process
 from pathlib import Path
@@ -14,12 +15,10 @@ from clemcore.agents.model_connection import resolve_agent_model_connection
 from clemcore.agents.mcp.bridge import OpenEnvMCPClient
 
 CLEMCORE_ROOT = Path(__file__).resolve().parents[3]
-SANDBOX_DIR = CLEMCORE_ROOT / "docker" / "agent-sandbox"
-# path to agent registry
-REGISTRY_PATH = SANDBOX_DIR / "agent_registry.json"
-# path to env file containing
-ENV_FILE = SANDBOX_DIR / ".env"
-
+SANDBOX_DIR = CLEMCORE_ROOT / "clemcore" / "docker" / "agent-sandbox"
+# paths required by the external-agent pipeline
+REGISTRY_PATH = Path("agent_registry.json").resolve()
+KEYS_PATH = Path("key.json").resolve()
 DOCKER_IMAGE = "clem-agent-sandbox:dev"
 # By convention I set 8001 to be PORT of the MCP server
 SERVER_PORT = 8001
@@ -169,23 +168,53 @@ def run_docker_episode(experiment_name: str,
     """
 
     # verify that the files required by the container exist
-    if not ENV_FILE.exists():
-        raise FileNotFoundError(f"Missing Docker env file: {ENV_FILE}")
+    if not KEYS_PATH.exists():
+        raise FileNotFoundError(f"Missing credentials file: {KEYS_PATH}")
 
     if not REGISTRY_PATH.exists():
         raise FileNotFoundError(f"Missing agent registry: {REGISTRY_PATH}")
 
+    # load the credentials used by external-agent command line tools
+    try:
+        keys = json.loads(
+            KEYS_PATH.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"Invalid credentials file: {KEYS_PATH}"
+        ) from error
+
+    if not isinstance(keys, dict):
+        raise ValueError(
+            f"Credentials file must contain a JSON object: {KEYS_PATH}"
+        )
+
+    container_environment = {
+        "OPENAI_API_KEY": keys.get("openai", {}).get("api_key"),
+        "ANTHROPIC_API_KEY": keys.get("anthropic", {}).get("api_key"),
+    }
+
+    container_environment = {
+        name: value
+        for name, value in container_environment.items()
+        if value
+    }
+
     # build the base Docker command and provide the episode information.
     command = [
         "docker", "run", "--rm", "-i",
-        "--env-file", str(ENV_FILE),
         "-e", f"OPENENV_MCP_URL={OPENENV_MCP_URL}",
         "-e", f"CLEM_EXPERIMENT_NAME={experiment_name}",
         "-e", f"CLEM_GAME_ID={game_id}",
         "-e", f"CLEM_AGENT_NAME={agent_name}",
         "-v", f"{CLEMCORE_ROOT}:/opt/clemcore:ro",
         "-v", f"{SANDBOX_DIR}:/app:ro",
+        "-v", f"{REGISTRY_PATH}:/tmp/agent_registry.json:ro",
     ]
+
+    # forward credentials without writing their values into the Docker command
+    for name in container_environment:
+        command.extend(["-e", name])
 
     # mount the writable directory used to exchange runtime state
     if shared_state_dir is not None:
@@ -216,14 +245,17 @@ def run_docker_episode(experiment_name: str,
     trace_lines: list[str] = []
 
     try:
+        process_environment = {
+            **os.environ,
+            **container_environment,
+        }
         # start the container and combine stdout and stderr
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+        process = subprocess.Popen(command,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT,
+                                   text=True,
+                                   bufsize=1,
+                                   env=process_environment)
 
         assert process.stdout is not None
 
