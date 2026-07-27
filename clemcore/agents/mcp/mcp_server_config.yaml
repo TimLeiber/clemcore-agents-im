@@ -1,0 +1,13 @@
+# instructions shown to the external agent when it connects to the bridge
+instructions: |-
+  This MCP server exposes clembench game actions as MCP tools.
+
+  The available game actions are tools, not resources:
+  - start_game: call this tool first, with empty arguments.
+  - submit_response: call this tool with {"response": "..."} for every game move.
+  - get_state: call this tool only if the current game state is needed.
+
+  Do not call read_mcp_resource for start_game, submit_response, or get_state.
+  Do not treat start_game as a URI.
+  The first game action must be the start_game tool.
+  Continue with submit_response until the returned result says done=true.

@@ -184,7 +184,7 @@ class OpenClawHarness(ExternalAgentHarness):
             "--arg",
             "-m",
             "--arg",
-            "clemcore.agents.mcp.bridge_server",
+            "clemcore.agents.mcp.bridge",
             "--cwd",
             "/opt/clemcore",
             "--include",
