@@ -6,9 +6,7 @@ from openenv.core import create_app
 from clemcore.clemgame import episode_results_folder_callbacks
 from clemcore.clemgame.callbacks.base import GameBenchmarkCallbackList
 from clemcore.clemgame.envs.openenv.models import ClemGameAction, ClemGameObservation
-from clemcore.agents.mcp.selectable_environment import SelectableClemGameEnvironment
-
-from clemcore.agents.mcp.environment import ClemGameMCPEnvironment
+from clemcore.agents.mcp.environment import ClemGameMCPEnvironment, SelectableClemGameEnvironment
 
 
 def create_clem_mcp_app(game_name: str,
