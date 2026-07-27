@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
-
 import uvicorn
 
-from clemcore.agents.mcp.app import create_clem_mcp_app
+from openenv.core import create_app
+
+from clemcore.clemgame import episode_results_folder_callbacks
+from clemcore.clemgame.envs.openenv.models import ClemGameAction, ClemGameObservation
+from clemcore.agents.mcp.environment import ClemGameMCPEnvironment, SelectableClemGameEnvironment
 
 
 def run_clem_mcp_server(game_name: str,
@@ -41,6 +44,7 @@ def run_clem_mcp_server(game_name: str,
         port: port used by the MCP server
         """
 
+    # ----- step 1 -----
     # derive the result directory name from the configured players when omitted
     if run_dir is None:
         registry_path = Path(registry_path).expanduser()
@@ -86,16 +90,35 @@ def run_clem_mcp_server(game_name: str,
         ordered_players.sort(key=lambda item: item[0])
         run_dir = "--".join(player_name for _, player_name in ordered_players)
 
-    # create the MCP application containing the selected clembench environment
-    app = create_clem_mcp_app(game_name=game_name,
-                              learner_agent=learner_agent,
-                              env_agents=env_agents,
-                              game_instance_split=game_instance_split,
-                              instances_filename=instances_filename,
-                              single_pass=single_pass,
-                              gen_args=gen_args,
-                              results_dir=results_dir,
-                              run_dir=run_dir)
+        # ----- step 2 -----
+        # collect the callbacks that make clembench write episode records to disk
+        callbacks = None
 
-    # expose the application to the host and Docker container
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        if results_dir is not None:
+            callbacks = episode_results_folder_callbacks(run_dir=run_dir,
+                                                         result_dir_path=results_dir,
+                                                         player_model_infos=None)
+
+        # ----- step 3 -----
+        # define how OpenEnv builds an environment, called once per agent session
+        def make_env():
+            base_env = SelectableClemGameEnvironment(game_name,
+                                                     instances_filename=instances_filename,
+                                                     game_instance_split=game_instance_split,
+                                                     single_pass=single_pass,
+                                                     learner_agent=learner_agent,
+                                                     env_agents=env_agents,
+                                                     gen_args=gen_args,
+                                                     callbacks=callbacks)
+
+            return ClemGameMCPEnvironment(base_env)
+
+        # ----- step 4 -----
+        # build the application exposing that environment over MCP
+        app = create_app(make_env,
+                         ClemGameAction,
+                         ClemGameObservation,
+                         env_name="clem_mcp_env")
+
+        # expose the application to the host and Docker container
+        uvicorn.run(app, host="0.0.0.0", port=port)
