@@ -2,94 +2,30 @@ import json
 import os
 import re
 import subprocess
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
+from clemcore.agents.adapters.utils import (
+    deep_merge_dicts,
+    load_model_connection,
+    mcp_environment,
+    model_connection_environment,
+    redact_sensitive,
+    resolve_runtime_model,
+    temporary_environment,
+    write_text_artifact,
+)
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _redact_sensitive(text: str) -> str:
-    redacted = text
-
-    # Raw key-like values.
-    redacted = re.sub(r"sk-or-[A-Za-z0-9._-]+", "[REDACTED]", redacted)
-    redacted = re.sub(r"sk-[A-Za-z0-9._-]+", "[REDACTED]", redacted)
-
-    # Prefix-preserving key assignments / log lines.
-    prefix_patterns = [
-        r"(?i)(api key:\s*)\S+",
-        r"(?i)(OPENROUTER_API_KEY=)\S+",
-        r"(?i)(OPENAI_API_KEY=)\S+",
-        r"(?i)(ANTHROPIC_API_KEY=)\S+",
-        r"(?i)(--token\s+)\S+",
-        r"(?i)(--openrouter-api-key\s+)\S+",
-    ]
-
-    for pattern in prefix_patterns:
-        redacted = re.sub(
-            pattern,
-            lambda match: f"{match.group(1)}[REDACTED]",
-            redacted,
-        )
-
-    return redacted
-
-
-def _deep_merge_dicts(base: dict[str, Any],
-                      patch: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-
-    for key, value in patch.items():
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(value, dict)
-        ):
-            merged[key] = _deep_merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-
-    return merged
-
-
-@contextmanager
-def _temporary_environment(env: dict[str, str | None]):
-    sentinel = object()
-    previous_values = {}
-
-    for key, value in env.items():
-        previous_values[key] = os.environ.get(key, sentinel)
-
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
-
-    try:
-        yield
-    finally:
-        for key, previous_value in previous_values.items():
-            if previous_value is sentinel:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = previous_value
+SESSION_PART_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 class OpenClawHarness(ExternalAgentHarness):
-    """
-    OpenClaw harness controlled through the OpenClaw CLI.
+    """Run OpenClaw through the OpenClaw CLI.
 
-    The target path is:
-      openclaw agent --local --model openrouter/<author>/<slug>
-
-    MCP is configured through OpenClaw's managed mcp.servers config before each
-    run. Raw stdout/stderr are preserved in adapter_messages.txt for downstream
-    transcript-with-tools parsing.
+    The harness creates an isolated OpenClaw home, registers the container-side
+    MCP bridge, applies benchmark configuration, and captures trace artifacts.
     """
 
     def __init__(self,
@@ -102,6 +38,20 @@ class OpenClawHarness(ExternalAgentHarness):
                  profile: str = "clembench-openclaw",
                  yolo: bool = True,
                  model_connection_path: str | None = None):
+        """Configure the OpenClaw harness.
+
+        Args:
+            model: model identifier passed directly to OpenClaw
+            clem_model: clembench model resolved by the outer pipeline
+            mcp_url: URL forwarded to the container-side MCP bridge
+            thinking: optional OpenClaw thinking level
+            verbose: whether to enable verbose OpenClaw output
+            timeout: maximum agent runtime in seconds
+            profile: isolated OpenClaw profile name
+            yolo: whether to disable OpenClaw approval gates
+            model_connection_path: optional resolved model-connection file
+        """
+
         self.model = model or clem_model
         self.clem_model = clem_model
         self.mcp_url = mcp_url
@@ -110,179 +60,23 @@ class OpenClawHarness(ExternalAgentHarness):
         self.timeout = timeout
         self.profile = profile
         self.yolo = yolo
-        self.model_connection_path = (
-            model_connection_path
-            or os.environ.get("CLEM_AGENT_MODEL_CONNECTION_PATH")
-        )
-        self._model_connection = self._load_model_connection()
-
-    def _load_model_connection(self) -> dict[str, Any] | None:
-        if not self.model_connection_path:
-            return None
-
-        path = Path(self.model_connection_path)
-
-        if not path.exists():
-            raise FileNotFoundError(f"Missing model connection file: {path}")
-
-        connection = _load_json(path)
-
-        if connection.get("harness") != "openclaw":
-            raise ValueError(f"Model connection is not for openclaw: {connection}")
-
-        return connection
-
-    def _runtime_model(self) -> str:
-        if self._model_connection:
-            return str(self._model_connection.get("model"))
-
-        if not self.model:
-            raise RuntimeError("OpenClawHarness requires either model or clem_model.")
-
-        return self.model
-
-    def _runtime_env(self) -> dict[str, str | None]:
-        if not self._model_connection:
-            return {}
-
-        return {
-            key: str(value) if value is not None else None
-            for key, value in self._model_connection.get("env", {}).items()
-        }
-
-    def _openclaw_base_command(self) -> list[str]:
-        return [
-            "openclaw",
-            "--no-color",
-            "--profile",
-            self.profile,
-            "--log-level",
-            "trace",
-        ]
-
-    def _mcp_add_command(self) -> list[str]:
-        env_entries = {
-            "OPENENV_MCP_URL": self.mcp_url,
-        }
-
-        for name in [
-            "CLEM_EXPERIMENT_NAME",
-            "CLEM_GAME_ID",
-            "CLEM_OPENENV_SESSION_PATH",
-        ]:
-            value = os.environ.get(name)
-
-            if value is not None:
-                env_entries[name] = value
-
-        command = self._openclaw_base_command() + [
-            "mcp",
-            "add",
-            "clem_game",
-            "--command",
-            "python",
-            "--arg",
-            "-m",
-            "--arg",
-            "clemcore.agents.mcp.bridge",
-            "--cwd",
-            "/opt/clemcore",
-            "--include",
-            "start_game,submit_response,get_state",
-            "--no-probe",
-        ]
-
-        for key, value in sorted(env_entries.items()):
-            command.extend(["--env", f"{key}={value}"])
-
-        return command
-
-    def _session_key(self) -> str:
-        parts = [
-            "clembench",
-            os.environ.get("CLEM_EXPERIMENT_NAME", "experiment"),
-            os.environ.get("CLEM_GAME_ID", "game"),
-            str(os.getpid()),
-        ]
-        safe_parts = [
-            re.sub(r"[^A-Za-z0-9_.-]+", "-", part).strip("-") or "x"
-            for part in parts
-        ]
-        return "agent:clembench:" + "-".join(safe_parts)
-
-    def _agent_command(self,
-                       instruction_path: Path) -> list[str]:
-        command = self._openclaw_base_command() + [
-            "agent",
-            "--local",
-            "--session-key",
-            self._session_key(),
-            "--model",
-            self._runtime_model(),
-            "--message-file",
-            str(instruction_path),
-            "--timeout",
-            str(self.timeout),
-            "--json",
-        ]
-
-        if self.thinking is not None:
-            command.extend(["--thinking", self.thinking])
-
-        if self.verbose:
-            command.extend(["--verbose", "on"])
-
-        return command
-
-    def _yolo_config_patch(self,
-                           log_path: Path | None = None) -> str:
-        config: dict[str, Any] = {}
-
-        if self._model_connection:
-            openclaw_config_patch = self._model_connection.get("openclaw_config_patch", {})
-
-            if isinstance(openclaw_config_patch, dict):
-                config = _deep_merge_dicts(config, openclaw_config_patch)
-
-        # Benchmark harness policy: no approval gates, no sandbox restriction.
-        if self.yolo:
-            config["tools"] = {
-                "exec": {
-                    "security": "full",
-                    "ask": "off",
-                },
-            }
-
-        # Benchmark trace policy: capture all accepted OpenClaw log surfaces to
-        # a known per-run JSONL file, then redact again before agent_trace.log.
-        if log_path is not None:
-            config["logging"] = {
-                "level": "trace",
-                "consoleLevel": "trace",
-                "consoleStyle": "json",
-                "file": str(log_path),
-                "redactSensitive": "tools",
-            }
-
-        return json.dumps(config)
-
-    def _yolo_config_command(self) -> list[str]:
-        return self._openclaw_base_command() + [
-            "config",
-            "patch",
-            "--stdin",
-        ]
-
-    def _models_set_command(self) -> list[str]:
-        return self._openclaw_base_command() + [
-            "models",
-            "set",
-            self._runtime_model(),
-        ]
+        self._model_connection = load_model_connection("openclaw", model_connection_path)
 
     def run_episode(self,
                     instruction: str,
-                    output_dir=None) -> AgentRunResult:
+                    output_dir: Path | str | None = None) -> AgentRunResult:
+        """Run one OpenClaw episode.
+
+        Args:
+            instruction: task instruction passed to OpenClaw
+            output_dir: optional directory for adapter artifacts
+
+        Returns:
+            the standardized OpenClaw run result
+        """
+
+        # ----- step 1 -----
+        # initialize metadata and resolve the runtime configuration
         metadata = {
             "adapter": "openclaw",
             "model": self.model,
@@ -306,99 +100,161 @@ class OpenClawHarness(ExternalAgentHarness):
                 "OpenClaw verbose stdout/stderr or session/transcript artifacts."
             ),
         }
-
         artifacts = {}
 
         try:
-            runtime_model = self._runtime_model()
+            runtime_model = resolve_runtime_model(model_connection=self._model_connection,
+                                                  model=self.model,
+                                                  harness_name="OpenClawHarness")
+            session_parts = [
+                "clembench",
+                os.environ.get("CLEM_EXPERIMENT_NAME", "experiment"),
+                os.environ.get("CLEM_GAME_ID", "game"),
+                str(os.getpid()),
+            ]
+            safe_session_parts = [SESSION_PART_PATTERN.sub("-", part).strip("-") or "x" for part in session_parts]
+            session_key = "agent:clembench:" + "-".join(safe_session_parts)
             metadata["runtime_model"] = runtime_model
-            metadata["session_key"] = self._session_key()
+            metadata["session_key"] = session_key
         except Exception as error:
             metadata["runtime_error"] = str(error)
-            return AgentRunResult(success=False, artifacts=artifacts, metadata=metadata)
+            return AgentRunResult(success=False,
+                                  artifacts=artifacts,
+                                  metadata=metadata)
 
-        if output_dir is None:
-            run_dir = Path("/tmp") / f"openclaw-clembench-{os.getpid()}"
-        else:
-            run_dir = Path(output_dir)
-
+        # ----- step 2 -----
+        # create isolated runtime storage and write the instruction
+        run_dir = Path(output_dir) if output_dir is not None else Path("/tmp") / f"openclaw-clembench-{os.getpid()}"
         run_dir.mkdir(parents=True, exist_ok=True)
-
         home_dir = run_dir / "openclaw_home"
         home_dir.mkdir(parents=True, exist_ok=True)
-
         openclaw_log_path = run_dir / "openclaw.log"
-        metadata["openclaw_log_path"] = str(openclaw_log_path)
-
         instruction_path = run_dir / "openclaw_instruction.txt"
         instruction_path.write_text(instruction, encoding="utf-8")
+        metadata["openclaw_log_path"] = str(openclaw_log_path)
 
-        runtime_env = self._runtime_env()
-        runtime_env.update({
+        # ----- step 3 -----
+        # build the OpenClaw environment and CLI commands
+        runtime_environment = model_connection_environment(self._model_connection)
+        runtime_environment.update({
             "HOME": str(home_dir),
             "OPENENV_MCP_URL": self.mcp_url,
-            "NODE_TLS_REJECT_UNAUTHORIZED": "0", # TODO: remove when connection problem is fixed
-
-            # Maximize OpenClaw-side diagnostics for benchmark trace capture.
-            # OpenClaw redacts known secrets, and the harness applies a second
-            # redaction pass before writing agent_trace.log.
+            # remove after the connection issue is fixed
+            "NODE_TLS_REJECT_UNAUTHORIZED": "0",
+            # maximize OpenClaw diagnostics for benchmark trace capture
             "OPENCLAW_LOG_LEVEL": "trace",
             "OPENCLAW_DEBUG_MODEL_TRANSPORT": "1",
             "OPENCLAW_DEBUG_MODEL_PAYLOAD": "full-redacted",
             "OPENCLAW_DEBUG_SSE": "peek",
             "OPENCLAW_DEBUG_CODE_MODE": "1",
         })
+        base_command = [
+            "openclaw",
+            "--no-color",
+            "--profile",
+            self.profile,
+            "--log-level",
+            "trace",
+        ]
+        bridge_environment = mcp_environment(self.mcp_url)
+        mcp_command = base_command + [
+            "mcp",
+            "add",
+            "clem_game",
+            "--command",
+            "python",
+            "--arg",
+            "-m",
+            "--arg",
+            "clemcore.agents.mcp.bridge",
+            "--cwd",
+            "/opt/clemcore",
+            "--include",
+            "start_game,submit_response,get_state",
+            "--no-probe",
+        ]
 
-        mcp_command = self._mcp_add_command()
-        yolo_config_command = self._yolo_config_command()
-        yolo_config_patch = self._yolo_config_patch(openclaw_log_path)
-        models_set_command = self._models_set_command()
-        agent_command = self._agent_command(instruction_path)
+        for name, value in sorted(bridge_environment.items()):
+            mcp_command.extend(["--env", f"{name}={value}"])
 
-        with _temporary_environment(runtime_env):
-            mcp_add = subprocess.run(
-                mcp_command,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=60,
-            )
+        openclaw_config: dict[str, Any] = {}
+        connection_patch = (self._model_connection or {}).get("openclaw_config_patch", {})
 
-            yolo_config = subprocess.run(
-                yolo_config_command,
-                input=yolo_config_patch,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=60,
-            )
+        if isinstance(connection_patch, dict):
+            openclaw_config = deep_merge_dicts(openclaw_config, connection_patch)
 
-            models_set = subprocess.run(
-                models_set_command,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=60,
-            )
+        if self.yolo:
+            openclaw_config["tools"] = {
+                "exec": {
+                    "security": "full",
+                    "ask": "off",
+                },
+            }
 
-            agent = subprocess.run(
-                agent_command,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=self.timeout + 30,
-            )
+        openclaw_config["logging"] = {
+            "level": "trace",
+            "consoleLevel": "trace",
+            "consoleStyle": "json",
+            "file": str(openclaw_log_path),
+            "redactSensitive": "tools",
+        }
+        config_command = base_command + ["config", "patch", "--stdin"]
+        config_patch = json.dumps(openclaw_config)
+        models_command = base_command + ["models", "set", runtime_model]
+        agent_command = base_command + [
+            "agent",
+            "--local",
+            "--session-key",
+            session_key,
+            "--model",
+            runtime_model,
+            "--message-file",
+            str(instruction_path),
+            "--timeout",
+            str(self.timeout),
+            "--json",
+        ]
 
-        openclaw_artifact_sections = []
+        if self.thinking is not None:
+            agent_command.extend(["--thinking", self.thinking])
 
+        if self.verbose:
+            agent_command.extend(["--verbose", "on"])
+
+        # ----- step 4 -----
+        # configure OpenClaw and run the agent
+        with temporary_environment(runtime_environment):
+            mcp_add = subprocess.run(mcp_command,
+                                     text=True,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE,
+                                     timeout=60)
+            config_result = subprocess.run(config_command,
+                                           input=config_patch,
+                                           text=True,
+                                           stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE,
+                                           timeout=60)
+            models_result = subprocess.run(models_command,
+                                           text=True,
+                                           stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE,
+                                           timeout=60)
+            agent_result = subprocess.run(agent_command,
+                                          text=True,
+                                          stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE,
+                                          timeout=self.timeout + 30)
+
+        # ----- step 5 -----
+        # collect OpenClaw logs and build the redacted trace
         artifact_candidates = [openclaw_log_path]
-
         artifact_candidates.extend(sorted(home_dir.glob(".openclaw*/agents/**/*.jsonl")))
         artifact_candidates.extend(sorted(home_dir.glob(".openclaw*/**/*.jsonl")))
         artifact_candidates.extend(sorted(home_dir.glob(".openclaw*/**/*.log")))
         artifact_candidates.extend(sorted(Path("/tmp").glob("openclaw*/openclaw*.log")))
         artifact_candidates.extend(sorted(Path("/tmp").glob("openclaw*/**/*.log")))
-
+        artifact_sections = []
         seen_artifacts = set()
 
         for artifact_path in artifact_candidates:
@@ -413,19 +269,16 @@ class OpenClawHarness(ExternalAgentHarness):
             seen_artifacts.add(resolved_artifact_path)
 
             try:
-                artifact_text = artifact_path.read_text(
-                    encoding="utf-8",
-                    errors="replace",
-                )
+                artifact_text = artifact_path.read_text(encoding="utf-8", errors="replace")
             except Exception as error:
                 artifact_text = f"[failed to read {artifact_path}: {error}]"
 
-            openclaw_artifact_sections.extend([
+            artifact_sections.extend([
                 f"openclaw_artifact: {artifact_path}",
                 artifact_text,
             ])
 
-        combined_trace = _redact_sensitive("\n".join([
+        combined_trace = redact_sensitive("\n".join([
             "openclaw_mcp_add_command:",
             " ".join(mcp_command),
             "openclaw_mcp_add_stdout:",
@@ -433,38 +286,40 @@ class OpenClawHarness(ExternalAgentHarness):
             "openclaw_mcp_add_stderr:",
             mcp_add.stderr,
             "openclaw_yolo_config_command:",
-            " ".join(yolo_config_command),
+            " ".join(config_command),
             "openclaw_yolo_config_patch:",
-            yolo_config_patch,
+            config_patch,
             "openclaw_yolo_config_stdout:",
-            yolo_config.stdout,
+            config_result.stdout,
             "openclaw_yolo_config_stderr:",
-            yolo_config.stderr,
+            config_result.stderr,
             "openclaw_models_set_command:",
-            " ".join(models_set_command),
+            " ".join(models_command),
             "openclaw_models_set_stdout:",
-            models_set.stdout,
+            models_result.stdout,
             "openclaw_models_set_stderr:",
-            models_set.stderr,
+            models_result.stderr,
             "openclaw_debug_environment:",
             json.dumps({
-                "OPENCLAW_LOG_LEVEL": runtime_env.get("OPENCLAW_LOG_LEVEL"),
-                "OPENCLAW_DEBUG_MODEL_TRANSPORT": runtime_env.get("OPENCLAW_DEBUG_MODEL_TRANSPORT"),
-                "OPENCLAW_DEBUG_MODEL_PAYLOAD": runtime_env.get("OPENCLAW_DEBUG_MODEL_PAYLOAD"),
-                "OPENCLAW_DEBUG_SSE": runtime_env.get("OPENCLAW_DEBUG_SSE"),
-                "OPENCLAW_DEBUG_CODE_MODE": runtime_env.get("OPENCLAW_DEBUG_CODE_MODE"),
+                "OPENCLAW_LOG_LEVEL": runtime_environment.get("OPENCLAW_LOG_LEVEL"),
+                "OPENCLAW_DEBUG_MODEL_TRANSPORT": runtime_environment.get("OPENCLAW_DEBUG_MODEL_TRANSPORT"),
+                "OPENCLAW_DEBUG_MODEL_PAYLOAD": runtime_environment.get("OPENCLAW_DEBUG_MODEL_PAYLOAD"),
+                "OPENCLAW_DEBUG_SSE": runtime_environment.get("OPENCLAW_DEBUG_SSE"),
+                "OPENCLAW_DEBUG_CODE_MODE": runtime_environment.get("OPENCLAW_DEBUG_CODE_MODE"),
                 "OPENCLAW_LOG_FILE": str(openclaw_log_path),
                 "OPENCLAW_THINKING": self.thinking,
             }, indent=2),
             "openclaw_agent_command:",
             " ".join(agent_command),
             "openclaw_agent_stdout:",
-            agent.stdout,
+            agent_result.stdout,
             "openclaw_agent_stderr:",
-            agent.stderr,
-            *openclaw_artifact_sections,
+            agent_result.stderr,
+            *artifact_sections,
         ]))
 
+        # ----- step 6 -----
+        # derive the run outcome from command results and visible tool calls
         tool_call_count_hint = (
             combined_trace.count("mcp__clem-game__")
             + combined_trace.count("mcp_clem_game_")
@@ -475,58 +330,53 @@ class OpenClawHarness(ExternalAgentHarness):
             + combined_trace.count('"submit_response"')
             + combined_trace.count('"get_state"')
         )
-
-        openclaw_incomplete_after_tools = (
+        incomplete_after_tools = (
             '"kind": "incomplete_turn"' in combined_trace
             and '"failures": 0' in combined_trace
             and "clem_game__start_game" in combined_trace
             and "clem_game__submit_response" in combined_trace
         )
-
-        metadata["returncode"] = agent.returncode
+        metadata["returncode"] = agent_result.returncode
         metadata["tool_call_count_hint"] = tool_call_count_hint
-        metadata["openclaw_incomplete_after_tools"] = openclaw_incomplete_after_tools
-
+        metadata["openclaw_incomplete_after_tools"] = incomplete_after_tools
         metadata["success"] = (
             mcp_add.returncode == 0
-            and yolo_config.returncode == 0
-            and models_set.returncode == 0
-            and agent.returncode == 0
-            and (
-                tool_call_count_hint > 0
-                or openclaw_incomplete_after_tools
-            )
+            and config_result.returncode == 0
+            and models_result.returncode == 0
+            and agent_result.returncode == 0
+            and (tool_call_count_hint > 0 or incomplete_after_tools)
         )
 
         if mcp_add.returncode != 0:
             metadata["runtime_error"] = "openclaw mcp add failed"
-        elif yolo_config.returncode != 0:
+        elif config_result.returncode != 0:
             metadata["runtime_error"] = "openclaw yolo config patch failed"
-        elif models_set.returncode != 0:
+        elif models_result.returncode != 0:
             metadata["runtime_error"] = "openclaw models set failed"
-        elif agent.returncode != 0:
+        elif agent_result.returncode != 0:
             metadata["runtime_error"] = "openclaw agent failed"
-        elif tool_call_count_hint <= 0 and not openclaw_incomplete_after_tools:
+        elif tool_call_count_hint <= 0 and not incomplete_after_tools:
             metadata["runtime_error"] = "openclaw completed without visible clem_game MCP tool calls"
-        elif openclaw_incomplete_after_tools:
-            metadata["runtime_error"] = None
 
-        if output_dir is not None:
-            trace_path = run_dir / "adapter_messages.txt"
-            trace_path.write_text(combined_trace, encoding="utf-8")
+        # ----- step 7 -----
+        # write the redacted trace and metadata
+        trace_path = write_text_artifact(output_dir=output_dir,
+                                         filename="adapter_messages.txt",
+                                         content=combined_trace)
+        metadata_path = write_text_artifact(output_dir=output_dir,
+                                            filename="openclaw_run_meta.json",
+                                            content=json.dumps(metadata,
+                                                               indent=2,
+                                                               sort_keys=True))
+
+        if trace_path is not None:
             artifacts["adapter_messages"] = trace_path
 
-            meta_path = run_dir / "openclaw_run_meta.json"
-            meta_path.write_text(
-                json.dumps(metadata, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-            artifacts["openclaw_run_meta"] = meta_path
+        if metadata_path is not None:
+            artifacts["openclaw_run_meta"] = metadata_path
 
         print(combined_trace)
 
-        return AgentRunResult(
-            success=bool(metadata["success"]),
-            artifacts=artifacts,
-            metadata=metadata,
-        )
+        return AgentRunResult(success=bool(metadata["success"]),
+                              artifacts=artifacts,
+                              metadata=metadata)

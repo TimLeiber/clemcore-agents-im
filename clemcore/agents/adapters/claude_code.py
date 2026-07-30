@@ -1,50 +1,24 @@
 import asyncio
-import json
-import os
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, query
 
 from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
-
-
-def _load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-@contextmanager
-def _temporary_environment(env: dict[str, str | None]):
-    sentinel = object()
-    previous_values = {}
-
-    for key, value in env.items():
-        previous_values[key] = os.environ.get(key, sentinel)
-
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
-
-    try:
-        yield
-    finally:
-        for key, previous_value in previous_values.items():
-            if previous_value is sentinel:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = previous_value
+from clemcore.agents.adapters.utils import (
+    load_model_connection,
+    model_connection_environment,
+    resolve_runtime_model,
+    temporary_environment,
+    write_text_artifact,
+)
 
 
 class ClaudeCodeHarness(ExternalAgentHarness):
-    """
-    Claude Code harness accessed through the Claude Agent SDK.
+    """Run Claude Code through the Claude Agent SDK.
 
-    If `clem_model` is configured, run_pipeline resolves it on the host using
-    clembench/model_registry.json + key.json and passes a minimal connection
-    file into Docker. This adapter translates that resolved OpenRouter
-    connection into Claude Code runtime configuration.
+    The harness configures the container-side MCP bridge as a Claude Code
+    server and collects every SDK message emitted during the episode.
     """
 
     def __init__(self,
@@ -55,155 +29,153 @@ class ClaudeCodeHarness(ExternalAgentHarness):
                  allowed_tools: list[str] | None = None,
                  permission_mode: str = "bypassPermissions",
                  model_connection_path: str | None = None):
+        """Configure the Claude Code harness.
+
+        Args:
+            model: model identifier passed directly to Claude Code
+            clem_model: clembench model resolved by the outer pipeline
+            mcp_url: URL forwarded to the container-side MCP bridge
+            max_turns: maximum number of Claude Code turns
+            allowed_tools: tools Claude Code may call
+            permission_mode: Claude Code tool-permission policy
+            model_connection_path: optional resolved model-connection file
+        """
+
         self.model = model or clem_model
         self.clem_model = clem_model
         self.mcp_url = mcp_url
         self.max_turns = max_turns
         self.allowed_tools = allowed_tools or ["mcp__clem-game__*"]
         self.permission_mode = permission_mode
-        self.model_connection_path = (
-            model_connection_path
-            or os.environ.get("CLEM_AGENT_MODEL_CONNECTION_PATH")
-        )
-        self._model_connection = self._load_model_connection()
-
-    def _load_model_connection(self) -> dict[str, Any] | None:
-        if not self.model_connection_path:
-            return None
-
-        path = Path(self.model_connection_path)
-
-        if not path.exists():
-            raise FileNotFoundError(f"Missing model connection file: {path}")
-
-        connection = _load_json(path)
-
-        if connection.get("harness") != "claude_code":
-            raise ValueError(f"Model connection is not for claude_code: {connection}")
-
-        return connection
-
-    def _runtime_model(self) -> str | None:
-        if self._model_connection:
-            return self._model_connection.get("model")
-
-        return self.model
-
-    def _runtime_env(self) -> dict[str, str | None]:
-        if not self._model_connection:
-            return {}
-
-        return {
-            key: str(value) if value is not None else None
-            for key, value in self._model_connection.get("env", {}).items()
-        }
+        self._model_connection = load_model_connection("claude_code", model_connection_path)
 
     async def run_episode_async(self,
-                                instruction: str) -> list[Any]:
+                                instruction: str,
+                                runtime_model: str | None,
+                                runtime_environment: dict[str, str | None]) -> tuple[list[Any], str | None]:
+        """Collect the asynchronous Claude SDK message stream.
+
+        This method is the asynchronous boundary required by the Claude Agent
+        SDK while the shared harness interface remains synchronous.
+
+        Args:
+            instruction: task instruction passed to Claude Code
+            runtime_model: resolved model identifier
+            runtime_environment: temporary model-provider environment
+
+        Returns:
+            the collected SDK messages and an optional runtime error
+        """
+
         options_kwargs = {
             "mcp_servers": {
                 "clem-game": {
                     "type": "stdio",
                     "command": "python",
-                    "args": [
-                        "-m",
-                        "clemcore.agents.mcp.bridge",
-                    ],
-                }
+                    "args": ["-m", "clemcore.agents.mcp.bridge"],
+                },
             },
             "allowed_tools": self.allowed_tools,
             "max_turns": self.max_turns,
             "permission_mode": self.permission_mode,
         }
 
-        runtime_model = self._runtime_model()
-
         if runtime_model:
             options_kwargs["model"] = runtime_model
 
         options = ClaudeAgentOptions(**options_kwargs)
-
         messages = []
-        self._runtime_error = None
+        runtime_error = None
 
-        with _temporary_environment(self._runtime_env()):
+        with temporary_environment(runtime_environment):
             try:
-                async for message in query(prompt=instruction,
-                                           options=options):
+                async for message in query(prompt=instruction, options=options):
                     messages.append(message)
                     print(message)
-
             except Exception as error:
-                self._runtime_error = str(error)
+                runtime_error = str(error)
                 print(f"agent_runtime_error: {error}")
 
-        return messages
+        return messages, runtime_error
 
     def run_episode(self,
                     instruction: str,
-                    output_dir=None) -> AgentRunResult:
-        messages = asyncio.run(self.run_episode_async(instruction))
+                    output_dir: Path | str | None = None) -> AgentRunResult:
+        """Run one Claude Code episode.
 
-        metadata = self._extract_metadata(messages)
-        artifacts = {}
+        Args:
+            instruction: task instruction passed to Claude Code
+            output_dir: optional directory for adapter artifacts
 
-        if output_dir is not None:
-            output_dir = Path(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
+        Returns:
+            the standardized Claude Code run result
+        """
 
-            messages_path = output_dir / "adapter_messages.txt"
-            messages_path.write_text(
-                "\n".join(repr(message) for message in messages),
-                encoding="utf-8",
-            )
-            artifacts["adapter_messages"] = messages_path
+        # ----- step 1 -----
+        # resolve the model and provider environment
+        runtime_model = resolve_runtime_model(model_connection=self._model_connection,
+                                              model=self.model,
+                                              harness_name="ClaudeCodeHarness",
+                                              required=False)
+        runtime_environment = model_connection_environment(self._model_connection)
 
-        return AgentRunResult(
-            success=metadata["success"],
-            artifacts=artifacts,
-            metadata=metadata,
+        # ----- step 2 -----
+        # run Claude Code and collect the SDK message stream
+        messages, runtime_error = asyncio.run(
+            self.run_episode_async(instruction=instruction,
+                                   runtime_model=runtime_model,
+                                   runtime_environment=runtime_environment)
         )
 
-    def _extract_metadata(self,
-                          messages: list[Any]) -> dict[str, Any]:
-        connection = self._model_connection or {}
-
+        # ----- step 3 -----
+        # extract standardized metadata from the SDK messages
         metadata = {
             "adapter": "claude_code",
             "model": self.model,
             "clem_model": self.clem_model,
-            "runtime_model": self._runtime_model(),
-            "resolved_backend": connection.get("backend"),
-            "gateway_base_url": self._runtime_env().get("ANTHROPIC_BASE_URL"),
+            "runtime_model": runtime_model,
+            "resolved_backend": (self._model_connection or {}).get("backend"),
+            "gateway_base_url": runtime_environment.get("ANTHROPIC_BASE_URL"),
             "success": False,
             "session_id": None,
             "duration_ms": None,
             "total_cost_usd": None,
             "num_turns": None,
             "stop_reason": None,
-            "runtime_error": getattr(self, "_runtime_error", None),
+            "runtime_error": runtime_error,
         }
 
         for message in messages:
-            session_id = getattr(message, "session_id", None)
+            session_id = getattr(message,
+                                 "session_id",
+                                 None)
 
             if session_id is not None:
                 metadata["session_id"] = session_id
 
-            subtype = getattr(message, "subtype", None)
-
-            if subtype == "success":
+            if getattr(message,
+                       "subtype",
+                       None) == "success":
                 metadata["success"] = True
 
-            for field_name in [
-                "duration_ms",
-                "total_cost_usd",
-                "num_turns",
-                "stop_reason",
-            ]:
-                value = getattr(message, field_name, None)
+            for field_name in ("duration_ms", "total_cost_usd", "num_turns", "stop_reason"):
+                value = getattr(message,
+                                field_name,
+                                None)
 
                 if value is not None:
                     metadata[field_name] = value
 
-        return metadata
+        # ----- step 4 -----
+        # write the raw SDK messages when artifact output is enabled
+        artifacts = {}
+        messages_path = write_text_artifact(output_dir=output_dir,
+                                            filename="adapter_messages.txt",
+                                            content="\n".join(repr(message) for message in messages))
+
+        if messages_path is not None:
+            artifacts["adapter_messages"] = messages_path
+
+        return AgentRunResult(success=bool(metadata["success"]),
+                              artifacts=artifacts,
+                              metadata=metadata)
