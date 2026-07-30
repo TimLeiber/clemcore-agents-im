@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from clemcore.agents.base import AgentRunResult, ExternalAgentHarness
+from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
 
 
 def _toml_string(value: str) -> str:

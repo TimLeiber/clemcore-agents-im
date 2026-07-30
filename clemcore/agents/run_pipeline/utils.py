@@ -11,7 +11,7 @@ from clemcore.clemgame.instances import GameInstances
 from clemcore.clemgame.registry import GameRegistry
 
 from clemcore.agents.mcp.server import run_clem_mcp_server
-from clemcore.agents.model_connection import resolve_agent_model_connection
+from clemcore.agents.adapters.model_connection import resolve_agent_model_connection
 from clemcore.agents.mcp.bridge import OpenEnvMCPClient
 
 CLEMCORE_ROOT = Path(__file__).resolve().parents[3]

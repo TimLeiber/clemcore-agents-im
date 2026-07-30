@@ -4,7 +4,7 @@ from typing import Any, Optional
 import json
 from pathlib import Path
 
-from clemcore.agents.base import AgentRunResult, ExternalAgentHarness
+from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
 
 
 class ExternalMCPHarness(ExternalAgentHarness):

@@ -7,7 +7,7 @@ from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, query
 
-from clemcore.agents.base import AgentRunResult, ExternalAgentHarness
+from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
 
 
 def _load_json(path: Path) -> dict[str, Any]:
