@@ -154,7 +154,7 @@ class HermesHarness(ExternalAgentHarness):
             f"CLEM_OPENENV_SESSION_PATH={os.environ.get('CLEM_OPENENV_SESSION_PATH', '')}",
             "--args",
             "-m",
-            "clemcore.agents.mcp.bridge_server",
+            "clemcore.agents.mcp.bridge",
         ]
 
     def _chat_command(self) -> list[str]:

@@ -107,7 +107,7 @@ class ClaudeCodeHarness(ExternalAgentHarness):
                     "command": "python",
                     "args": [
                         "-m",
-                        "clemcore.agents.mcp.bridge_server",
+                        "clemcore.agents.mcp.bridge",
                     ],
                 }
             },

@@ -109,11 +109,9 @@ def start_server(game_name: str,
             "agent_name": agent_name,
             "registry_path": REGISTRY_PATH,
             "learner_agent": agent_player,
-            "env_agents": _env_agents_from_models(
-                models=env_agent_models,
-                learner_agent=agent_player,
-                game_name=game_name,
-            ),
+            "env_agents": _env_agents_from_models(models=env_agent_models,
+                                                  learner_agent=agent_player,
+                                                  game_name=game_name),
             "game_instance_split": None,
             "instances_filename": instances_filename,
             "single_pass": False,
@@ -298,28 +296,19 @@ def run_docker_episode(experiment_name: str,
                         client.session_id = session_id
 
                         try:
-                            result = client.call_tool(
-                                "submit_response",
-                                {"response": CONTROL_FAILURE_RESPONSE},
-                            )
-                            print(
-                                f"openenv_control_failure_submitted: "
-                                f"session_id={session_id} done={result.get('done')}"
-                            )
+                            result = client.call_tool("submit_response",{"response": CONTROL_FAILURE_RESPONSE})
+                            print(f"openenv_control_failure_submitted: "
+                                  f"session_id={session_id} done={result.get('done')}")
                         except Exception as error:
-                            print(
-                                f"openenv_control_failure_failed: "
-                                f"session_id={session_id} error={error}"
-                            )
+                            print(f"openenv_control_failure_failed: "
+                                  f"session_id={session_id} error={error}")
 
                         try:
                             client.close_session()
                             print(f"openenv_session_closed: {session_id}")
                         except Exception as error:
-                            print(
-                                f"openenv_session_close_failed: "
-                                f"session_id={session_id} error={error}"
-                            )
+                            print(f"openenv_session_close_failed: "
+                                  f"session_id={session_id} error={error}")
 
                 except (OSError, json.JSONDecodeError) as error:
                     print(f"openenv_session_file_invalid: path={session_path} error={error}")
@@ -351,13 +340,8 @@ def write_agent_trace(results_dir: str,
 
     # find all episode directories that exist after the run
     results_path = Path(results_dir)
-    after_episode_dirs = {
-        path
-        for path in results_path.glob(
-            f"*/{game_name}/{experiment_name}/episode_*"
-        )
-        if path.is_dir()
-    }
+    after_episode_dirs = {path for path in results_path.glob(f"*/{game_name}/{experiment_name}/episode_*")
+                          if path.is_dir()}
 
     # record the modification time of every episode directory
     episode_timestamps = {}
@@ -369,20 +353,13 @@ def write_agent_trace(results_dir: str,
             episode_dir,
         ]
 
-        episode_timestamps[episode_dir] = max(
-            path.stat().st_mtime
-            for path in timestamp_candidates
-            if path.exists()
-        )
+        episode_timestamps[episode_dir] = max(path.stat().st_mtime for path in timestamp_candidates if path.exists())
 
     # first try to identify an episode directory created by this run
     new_episode_dirs = after_episode_dirs - before_episode_dirs
 
     if new_episode_dirs:
-        output_dir = max(
-            new_episode_dirs,
-            key=episode_timestamps.get,
-        )
+        output_dir = max(new_episode_dirs, key=episode_timestamps.get)
 
     else:
         # fall back to an existing episode directory with the same game ID
@@ -520,34 +497,38 @@ def _env_agents_from_models(models: list[str],
 
     return dict(zip(env_player_ids, models))
 
-
-
-
-
-
 def _write_agent_model_connection(agent_name: str,
                                   output_dir: Path) -> Path | None:
-    connection = resolve_agent_model_connection(
-        agent_name=agent_name,
-        registry_path=REGISTRY_PATH,
-    )
+    """Resolve and write the model connection required by an external agent.
 
+    Args:
+        agent_name: name of the external agent from the agent registry
+        output_dir: directory where the connection file should be written
+
+    Returns:
+        path to the written model connection file, or None when the agent
+        does not use a clemcore model connection
+    """
+
+    # resolve the clemcore model used by the external agent
+    connection = resolve_agent_model_connection(agent_name=agent_name, registry_path=REGISTRY_PATH)
+
+    # agents without an associated clemcore model need no connection file
     if connection is None:
         return None
 
+    # write the connection into the temporary directory shared with the container
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "model_connection.json"
-    output_path.write_text(
-        json.dumps(connection, indent=2),
-        encoding="utf-8",
-    )
+    output_path.write_text(json.dumps(connection, indent=2), encoding="utf-8")
+
+    # restrict access because the connection may contain credentials
     output_path.chmod(0o600)
 
-    print(
-        "agent_model_connection: "
-        f"clem_model={connection.get('clem_model')} "
-        f"backend={connection.get('backend')} "
-        f"runtime_model={connection.get('model')}"
-    )
+    # print the resolved connection without exposing sensitive values
+    print("agent_model_connection: "
+          f"clem_model={connection.get('clem_model')} "
+          f"backend={connection.get('backend')} "
+          f"runtime_model={connection.get('model')}")
 
     return output_path
