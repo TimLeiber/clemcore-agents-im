@@ -317,6 +317,7 @@ def run_docker_episode(experiment_name: str,
 
 
 def write_agent_trace(results_dir: str,
+                      run_dir: str,
                       game_name: str,
                       experiment_name: str,
                       game_id: int | str,
@@ -327,6 +328,7 @@ def write_agent_trace(results_dir: str,
 
     Args:
         results_dir: Root directory containing the clembench results.
+        run_dir: Exact dialogue-pair directory used by the MCP server.
         game_name: Name of the game that was run.
         experiment_name: Name of the experiment containing the episode.
         game_id: Identifier of the game instance that was run.
@@ -340,7 +342,7 @@ def write_agent_trace(results_dir: str,
 
     # find all episode directories that exist after the run
     results_path = Path(results_dir)
-    after_episode_dirs = {path for path in results_path.glob(f"*/{game_name}/{experiment_name}/episode_*")
+    after_episode_dirs = {path for path in results_path.glob(f"{run_dir}/{game_name}/{experiment_name}/episode_*")
                           if path.is_dir()}
 
     try:
@@ -402,6 +404,7 @@ def write_agent_trace(results_dir: str,
             output_dir = (
                 results_path
                 / "_agent_failures"
+                / run_dir
                 / game_name
                 / experiment_name
                 / f"game_id_{game_id}"

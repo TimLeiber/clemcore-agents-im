@@ -9,6 +9,39 @@ from clemcore.clemgame.envs.openenv.models import ClemGameAction, ClemGameObserv
 from clemcore.agents.mcp.environment import ClemGameMCPEnvironment, SelectableClemGameEnvironment
 
 
+def result_run_dir_name(agent_name: str,
+                        registry_path: str | Path,
+                        learner_agent: str = "player_0",
+                        env_agents: dict[str, str] | None = None) -> str:
+    """Return the deterministic clembench result directory for a player set."""
+    registry_path = Path(registry_path).expanduser()
+    with open(registry_path, "r", encoding="utf-8") as file:
+        registry = json.load(file)
+
+    matches = [entry for entry in registry if entry["agent_name"] == agent_name]
+    if not matches:
+        known_agents = [entry["agent_name"] for entry in registry]
+        raise ValueError(
+            f"Unknown agent '{agent_name}'. Known agents: {known_agents}"
+        )
+
+    spec = matches[0]
+    model_name = spec.get("agent_config", {}).get("model")
+    external_name = f"{agent_name}_{model_name}" if model_name else agent_name
+    player_names = dict(env_agents or {})
+    player_names[learner_agent] = external_name
+    ordered_players = []
+
+    for player_id, player_name in player_names.items():
+        prefix = "player_"
+        suffix = player_id[len(prefix):] if player_id.startswith(prefix) else ""
+        sort_key = (0, int(suffix)) if suffix.isdigit() else (1, player_id)
+        ordered_players.append((sort_key, player_name))
+
+    ordered_players.sort(key=lambda item: item[0])
+    return "--".join(player_name for _, player_name in ordered_players)
+
+
 def run_clem_mcp_server(game_name: str,
                         agent_name: str,
                         registry_path: str | Path,
@@ -47,48 +80,12 @@ def run_clem_mcp_server(game_name: str,
     # ----- step 1 -----
     # derive the result directory name from the configured players when omitted
     if run_dir is None:
-        registry_path = Path(registry_path).expanduser()
-
-        with open(registry_path, "r", encoding="utf-8") as file:
-            registry = json.load(file)
-
-        matches = [
-            entry
-            for entry in registry
-            if entry["agent_name"] == agent_name
-        ]
-
-        if not matches:
-            known_agents = [entry["agent_name"] for entry in registry]
-            raise ValueError(
-                f"Unknown agent '{agent_name}'. Known agents: {known_agents}"
-            )
-
-        # include the external agent model in the result directory name
-        spec = matches[0]
-        model_name = spec.get("agent_config", {}).get("model")
-        external_name = f"{agent_name}_{model_name}" if model_name else agent_name
-
-        # collect the model or agent name assigned to every player slot
-        player_names = dict(env_agents or {})
-        player_names[learner_agent] = external_name
-
-        # order conventional player_N slots numerically before other identifiers
-        ordered_players = []
-
-        for player_id, player_name in player_names.items():
-            prefix = "player_"
-            suffix = player_id[len(prefix):] if player_id.startswith(prefix) else ""
-
-            if suffix.isdigit():
-                sort_key = 0, int(suffix)
-            else:
-                sort_key = 1, player_id
-
-            ordered_players.append((sort_key, player_name))
-
-        ordered_players.sort(key=lambda item: item[0])
-        run_dir = "--".join(player_name for _, player_name in ordered_players)
+        run_dir = result_run_dir_name(
+            agent_name=agent_name,
+            registry_path=registry_path,
+            learner_agent=learner_agent,
+            env_agents=env_agents,
+        )
 
         # ----- step 2 -----
         # collect the callbacks that make clembench write episode records to disk

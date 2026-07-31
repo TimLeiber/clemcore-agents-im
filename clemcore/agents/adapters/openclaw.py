@@ -30,6 +30,25 @@ GAME_TOOL_MARKERS = (
 )
 
 
+def _validate_openclaw_model_connection(connection: dict[str, Any] | None) -> None:
+    """Reject inconsistent resolved OpenRouter connections before CLI startup."""
+    if not connection or connection.get("backend") != "openrouter":
+        return
+
+    runtime_model = connection.get("model")
+    if not isinstance(runtime_model, str) or not runtime_model.startswith("openrouter/"):
+        raise ValueError(
+            "OpenClaw OpenRouter connections require a canonical "
+            f"openrouter/<provider>/<model> reference, got {runtime_model!r}."
+        )
+
+    environment = connection.get("env")
+    if not isinstance(environment, dict) or not environment.get("OPENROUTER_API_KEY"):
+        raise ValueError(
+            "OpenClaw OpenRouter connections require OPENROUTER_API_KEY."
+        )
+
+
 def _error_from_output(*outputs: str) -> str | None:
     """Return the most useful OpenClaw error without dumping its full trace."""
 
@@ -96,6 +115,7 @@ class OpenClawHarness(ExternalAgentHarness):
         self.yolo = yolo
         self.debug = debug
         self._model_connection = load_model_connection("openclaw", model_connection_path)
+        _validate_openclaw_model_connection(self._model_connection)
 
     def run_episode(self,
                     instruction: str,
@@ -177,6 +197,17 @@ class OpenClawHarness(ExternalAgentHarness):
         connection_patch = (self._model_connection or {}).get("openclaw_config_patch", {})
         if isinstance(connection_patch, dict):
             openclaw_config = deep_merge_dicts(openclaw_config, connection_patch)
+        if (self._model_connection or {}).get("backend") == "openrouter":
+            openclaw_config = deep_merge_dicts(
+                openclaw_config,
+                {
+                    "env": {
+                        "OPENROUTER_API_KEY": runtime_environment[
+                            "OPENROUTER_API_KEY"
+                        ],
+                    },
+                },
+            )
         if self.yolo:
             openclaw_config["tools"] = {"exec": {"security": "full", "ask": "off"}}
         openclaw_config["logging"] = {
@@ -282,9 +313,9 @@ class OpenClawHarness(ExternalAgentHarness):
         if metadata_path is not None:
             artifacts["openclaw_run_meta"] = metadata_path
 
+        if self.debug:
+            print(combined_trace)
         if metadata["runtime_error"]:
             print(metadata["runtime_error"])
-        elif self.debug:
-            print(combined_trace)
 
         return AgentRunResult(bool(metadata["success"]), artifacts, metadata)
