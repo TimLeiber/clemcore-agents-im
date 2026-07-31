@@ -91,6 +91,21 @@ class OpenEnvMCPClient:
         self._request("openenv/session/close", {"session_id": self.session_id})
         self.session_id = None
 
+        # The shared file is a recovery marker for a session that is still
+        # active when the container exits. Remove it only after the host has
+        # confirmed the close; if closing fails, leave it in place so the
+        # pipeline can retry cleanup outside the container.
+        session_path = os.environ.get("CLEM_OPENENV_SESSION_PATH")
+
+        if session_path:
+            try:
+                Path(session_path).unlink(missing_ok=True)
+            except OSError as error:
+                print(
+                    f"failed to remove closed OpenEnv session marker: {error}",
+                    file=sys.stderr,
+                )
+
     def call_tool(self,
                   name: str,
                   arguments: dict[str, Any] | None = None) -> dict[str, Any]:

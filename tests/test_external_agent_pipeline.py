@@ -11,11 +11,35 @@ from clemcore.agents.adapters.openclaw import (
     OpenClawHarness,
     _validate_openclaw_model_connection,
 )
+from clemcore.agents.mcp.bridge import OpenEnvMCPClient
 from clemcore.agents.mcp.server import result_run_dir_name
 from clemcore.agents.run_pipeline.utils import write_agent_trace
 
 
 class TestExternalAgentPipeline(unittest.TestCase):
+    def test_closed_openenv_session_removes_recovery_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session_path = Path(directory) / "openenv_session.json"
+            session_path.write_text(
+                json.dumps({"session_id": "session-1"}),
+                encoding="utf-8",
+            )
+            client = OpenEnvMCPClient("http://example.invalid/mcp")
+            client.session_id = "session-1"
+
+            with patch.object(client, "_request", return_value={}) as request, patch.dict(
+                "os.environ",
+                {"CLEM_OPENENV_SESSION_PATH": str(session_path)},
+            ):
+                client.close_session()
+
+            request.assert_called_once_with(
+                "openenv/session/close",
+                {"session_id": "session-1"},
+            )
+            self.assertIsNone(client.session_id)
+            self.assertFalse(session_path.exists())
+
     def test_openclaw_rejects_mismatched_openrouter_connection(self):
         with self.assertRaisesRegex(ValueError, "canonical"):
             _validate_openclaw_model_connection({
@@ -91,6 +115,19 @@ class TestExternalAgentPipeline(unittest.TestCase):
         self.assertEqual(
             config["env"]["OPENROUTER_API_KEY"],
             "openrouter-test-key",
+        )
+        self.assertEqual(
+            config["plugins"],
+            {"enabled": True, "allow": ["openrouter"]},
+        )
+        self.assertNotIn("profile", config["tools"])
+        self.assertEqual(
+            config["tools"]["allow"],
+            [
+                "clem_game__start_game",
+                "clem_game__submit_response",
+                "clem_game__get_state",
+            ],
         )
         self.assertTrue(result.success)
 
