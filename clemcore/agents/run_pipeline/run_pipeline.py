@@ -38,7 +38,7 @@ def main() -> None:
     parser.add_argument("-m",
                         "--models",
                         nargs="+",
-                        default=["mock"],
+                        default=[],
                         help="Native clem model(s) for non-external players, matching clem run -m style.")
     parser.add_argument("--agent-player",
                         default="player_0",
