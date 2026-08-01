@@ -203,8 +203,8 @@ class HermesHarness(ExternalAgentHarness):
 
         metadata["returncode"] = chat.returncode
         metadata["tool_call_count_hint"] = (
-            chat.stdout.count("mcp_clem_game_")
-            + chat.stderr.count("mcp_clem_game_")
+                chat.stdout.count("Tool call: mcp__clem_game__")
+                + chat.stderr.count("Tool call: mcp__clem_game__")
         )
         metadata["success"] = (
             register.returncode == 0
