@@ -11,7 +11,7 @@ from clemcore.clemgame.instances import GameInstances
 from clemcore.clemgame.registry import GameRegistry
 
 from clemcore.agents.mcp.server import run_clem_mcp_server
-from clemcore.agents.model_connection import resolve_agent_model_connection
+from clemcore.agents.adapters.model_connection import resolve_agent_model_connection
 from clemcore.agents.mcp.bridge import OpenEnvMCPClient
 
 CLEMCORE_ROOT = Path(__file__).resolve().parents[3]
@@ -317,6 +317,7 @@ def run_docker_episode(experiment_name: str,
 
 
 def write_agent_trace(results_dir: str,
+                      run_dir: str,
                       game_name: str,
                       experiment_name: str,
                       game_id: int | str,
@@ -327,6 +328,7 @@ def write_agent_trace(results_dir: str,
 
     Args:
         results_dir: Root directory containing the clembench results.
+        run_dir: Exact dialogue-pair directory used by the MCP server.
         game_name: Name of the game that was run.
         experiment_name: Name of the experiment containing the episode.
         game_id: Identifier of the game instance that was run.
@@ -340,8 +342,17 @@ def write_agent_trace(results_dir: str,
 
     # find all episode directories that exist after the run
     results_path = Path(results_dir)
-    after_episode_dirs = {path for path in results_path.glob(f"*/{game_name}/{experiment_name}/episode_*")
+    after_episode_dirs = {path for path in results_path.glob(f"{run_dir}/{game_name}/{experiment_name}/episode_*")
                           if path.is_dir()}
+
+    try:
+        run_started_timestamp = datetime.fromisoformat(
+            str(metadata["started_at"])
+        ).timestamp()
+    except (KeyError, TypeError, ValueError):
+        # If the caller cannot establish the run boundary, prefer the failure
+        # tree over risking an overwrite of an unrelated historical episode.
+        run_started_timestamp = datetime.now(timezone.utc).timestamp()
 
     # record the modification time of every episode directory
     episode_timestamps = {}
@@ -362,7 +373,10 @@ def write_agent_trace(results_dir: str,
         output_dir = max(new_episode_dirs, key=episode_timestamps.get)
 
     else:
-        # fall back to an existing episode directory with the same game ID
+        # Only reuse an existing episode directory if this run actually
+        # modified it. A failed agent may create no episode at all; selecting
+        # an old directory by game_id alone can overwrite another agent's
+        # trace because all result trees reuse the same episode numbers.
         matching_episode_dirs = []
 
         for episode_dir in after_episode_dirs:
@@ -378,7 +392,8 @@ def write_agent_trace(results_dir: str,
             except json.JSONDecodeError:
                 continue
 
-            if int(instance.get("game_id")) == int(game_id):
+            if (int(instance.get("game_id")) == int(game_id)
+                    and episode_timestamps[episode_dir] >= run_started_timestamp):
                 matching_episode_dirs.append(episode_dir)
 
         if matching_episode_dirs:
@@ -389,6 +404,7 @@ def write_agent_trace(results_dir: str,
             output_dir = (
                 results_path
                 / "_agent_failures"
+                / run_dir
                 / game_name
                 / experiment_name
                 / f"game_id_{game_id}"
@@ -484,10 +500,7 @@ def _env_agents_from_models(models: list[str],
         )
 
     # Remove the player controlled by the external agent
-    env_player_ids = [
-        player_id for player_id in player_ids
-        if player_id != learner_agent
-    ]
+    env_player_ids = [player_id for player_id in player_ids if player_id != learner_agent]
 
     if len(models) < len(env_player_ids):
         raise ValueError(

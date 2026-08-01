@@ -4,9 +4,12 @@ from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 
+from clemcore.agents.mcp.server import result_run_dir_name
+
 # import all functions from utils needed to run main
 from .utils import (
     DOCKER_IMAGE, # Docker image used for agent episodes
+    REGISTRY_PATH, # external-agent registry used by server and container
     _env_agents_from_models, # map native models to player slots
     _write_agent_model_connection, # write the agent model configuration
 
@@ -92,6 +95,13 @@ def main() -> None:
     print(f"results_dir: {args.results_dir}")
     print(game_instances.describe())
 
+    result_run_dir = result_run_dir_name(
+        agent_name=args.agent,
+        registry_path=REGISTRY_PATH,
+        learner_agent=args.agent_player,
+        env_agents=env_agents,
+    )
+
     # create temporary shared storage for the agent runtime
     temp_dir = tempfile.TemporaryDirectory(prefix="clem-agent-model-")
     # resolve and write the external agent model connection
@@ -134,7 +144,9 @@ def main() -> None:
 
             # record the episode directories that exist before this run
             before_episode_dirs = {path
-                                   for path in Path(args.results_dir).glob(f"*/{args.game}/{experiment_name}/episode_*")
+                                   for path in Path(args.results_dir).glob(
+                                       f"{result_run_dir}/{args.game}/{experiment_name}/episode_*"
+                                   )
                                    if path.is_dir()}
 
             # record start time and remove session file from previous episode
@@ -159,6 +171,7 @@ def main() -> None:
             # write the captured trace and metadata
             trace_path = write_agent_trace(
                 results_dir=args.results_dir,
+                run_dir=result_run_dir,
                 game_name=args.game,
                 experiment_name=experiment_name,
                 game_id=game_id,

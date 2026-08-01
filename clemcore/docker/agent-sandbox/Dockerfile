@@ -100,7 +100,9 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
         wordfreq \
         wordninja
 
-RUN npm install -g @anthropic-ai/claude-code @openai/codex openclaw@latest
+# Keep OpenClaw reproducible across image rebuilds. Version 2026.6.11 is the
+# version recorded in the last known-successful OpenRouter benchmark traces.
+RUN npm install -g @anthropic-ai/claude-code @openai/codex openclaw@2026.6.11
 
 COPY pyproject.toml /tmp/clemcore-pyproject.toml
 
@@ -112,6 +114,7 @@ RUN mkdir -p /tmp/clemcore-build && \
     pip install --no-cache-dir /tmp/clemcore-build && \
     pip install --no-cache-dir \
         claude-agent-sdk \
+        ddgs==9.14.4 \
         fastmcp \
         openai-codex \
         "hermes-agent[cli,mcp]"

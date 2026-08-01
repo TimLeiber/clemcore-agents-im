@@ -6,16 +6,14 @@ from pathlib import Path
 from typing import Any
 
 from clemcore.agents import adapters
-from clemcore.agents.base import AgentRunResult
+from clemcore.agents.adapters.base import AgentRunResult
 from clemcore.agents.adapters.claude_code import ClaudeCodeHarness
 from clemcore.agents.adapters.codex import CodexHarness
 from clemcore.agents.adapters.hermes import HermesHarness
-from clemcore.agents.adapters.manual_mcp import ExternalMCPHarness
 from clemcore.agents.adapters.openclaw import OpenClawHarness
 
 # adapters currently supported by the external-agent runner
-BACKENDS = {"manual_mcp": ExternalMCPHarness,
-            "claude_code": ClaudeCodeHarness,
+BACKENDS = {"claude_code": ClaudeCodeHarness,
             "codex": CodexHarness,
             "hermes": HermesHarness,
             "openclaw": OpenClawHarness}
