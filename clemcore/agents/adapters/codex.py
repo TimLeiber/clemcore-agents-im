@@ -140,20 +140,9 @@ class CodexHarness(ExternalAgentHarness):
         if last_message_path.exists():
             last_message_path.unlink()
 
-        codex_instruction = instruction + """
-
-Codex-specific execution rule:
-The MCP server named clem_game is already configured.
-It exposes exactly these game tools: start_game, submit_response, get_state.
-Do not search for tools.
-Do not inspect tools.
-Do not explain what you will do.
-Do not finish the turn with reasoning only.
-The first action you produce must be an MCP tool call to clem_game.start_game.
-After start_game returns, continue only by calling clem_game.submit_response until the game result says done=true.
-"""
         command = [
             "codex",
+            "--search",
             "exec",
             "--strict-config",
             "--json",
@@ -233,7 +222,7 @@ After start_game returns, continue only by calling clem_game.submit_response unt
         try:
             with temporary_environment(runtime_environment):
                 completed = subprocess.run(command,
-                                           input=codex_instruction,
+                                           input=instruction,
                                            text=True,
                                            stdout=subprocess.PIPE,
                                            stderr=subprocess.PIPE,
