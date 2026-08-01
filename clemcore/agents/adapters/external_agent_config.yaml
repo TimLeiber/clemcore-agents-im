@@ -33,3 +33,12 @@ meta_prompt: |-
   Follow the environment messages exactly.
   Respect the required response format from the game.
   Try to achieve the best possible score.
+
+# additional harness configs
+hermes:
+
+claude_code:
+
+codex:
+
+openclaw:
