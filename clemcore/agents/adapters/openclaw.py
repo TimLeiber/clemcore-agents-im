@@ -144,21 +144,13 @@ class OpenClawHarness(ExternalAgentHarness):
 
         config = (self._model_connection or {}).get("openclaw_config_patch", {})
         config = dict(config) if isinstance(config, dict) else {}
-        # Restrict the model-facing tool inventory to the three Clem MCP tools.
-        # Do not combine this absolute allowlist with the ``minimal`` profile:
-        # profiles are applied first, and that profile removes plugin-provided
-        # MCP tools before the allowlist can select them.
+        # Keep OpenClaw's default tool inventory available in YOLO mode so that
+        # models can use standard tools in addition to the Clem MCP tools.
         config = deep_merge_dicts(config, {
-            # The native OpenRouter model catalog is supplied by this plugin,
-            # so retain it while excluding unrelated bundled plugins.
-            "plugins": {"enabled": True, "allow": ["openrouter"]},
-            "tools": {
-                "allow": [
-                    "clem_game__start_game",
-                    "clem_game__submit_response",
-                    "clem_game__get_state",
-                ],
-            },
+            # The native OpenRouter model catalog is supplied by this plugin, so retain it while excluding unrelated bundled plugins.
+            "plugins": {"enabled": True, "allow": ["openrouter", "duckduckgo", "browser"]},
+            "browser": {"enabled": True, "headless": True, "noSandbox": True},
+            "tools": {"web": {"search": {"enabled": True, "provider": "duckduckgo"}}},
         })
         if (self._model_connection or {}).get("backend") == "openrouter":
             config = deep_merge_dicts(config, {
