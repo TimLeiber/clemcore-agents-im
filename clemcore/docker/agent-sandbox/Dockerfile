@@ -114,6 +114,7 @@ RUN mkdir -p /tmp/clemcore-build && \
     pip install --no-cache-dir /tmp/clemcore-build && \
     pip install --no-cache-dir \
         claude-agent-sdk \
+        ddgs==9.14.4 \
         fastmcp \
         openai-codex \
         "hermes-agent[cli,mcp]"
