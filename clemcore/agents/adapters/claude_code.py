@@ -45,14 +45,14 @@ class ClaudeCodeHarness(ExternalAgentHarness):
         self.clem_model = clem_model
         self.mcp_url = mcp_url
         self.max_turns = max_turns
-        self.allowed_tools = allowed_tools or ["mcp__clem-game__*"]
+        self.allowed_tools = allowed_tools or ["mcp__clem_game__*"]
         self.permission_mode = permission_mode
         self._model_connection = load_model_connection("claude_code", model_connection_path)
 
     async def run_episode_async(self,
                                 instruction: str,
                                 runtime_model: str | None,
-                                runtime_environment: dict[str, str | None]) -> tuple[list[Any], str | None]:
+                                runtime_environment: dict[str, str | None]) -> tuple[list[Any], str | None, bool]:
         """Collect the asynchronous Claude SDK message stream.
 
         This method is the asynchronous boundary required by the Claude Agent
@@ -64,12 +64,13 @@ class ClaudeCodeHarness(ExternalAgentHarness):
             runtime_environment: temporary model-provider environment
 
         Returns:
-            the collected SDK messages and an optional runtime error
+            the collected SDK messages, an optional runtime error, and whether
+            the game completed
         """
 
         options_kwargs = {
             "mcp_servers": {
-                "clem-game": {
+                "clem_game": {
                     "type": "stdio",
                     "command": "python",
                     "args": ["-m", "clemcore.agents.mcp.bridge"],
@@ -86,17 +87,26 @@ class ClaudeCodeHarness(ExternalAgentHarness):
         options = ClaudeAgentOptions(**options_kwargs)
         messages = []
         runtime_error = None
+        game_completed = False
 
         with temporary_environment(runtime_environment):
             try:
                 async for message in query(prompt=instruction, options=options):
                     messages.append(message)
                     print(message)
+
+                    tool_use_result = getattr(message, "tool_use_result", None)
+                    structured_content = (tool_use_result.get("structuredContent")
+                                          if isinstance(tool_use_result, dict) else None)
+
+                    if isinstance(structured_content, dict) and structured_content.get("done") is True:
+                        game_completed = True
+                        break
             except Exception as error:
                 runtime_error = str(error)
                 print(f"agent_runtime_error: {error}")
 
-        return messages, runtime_error
+        return messages, runtime_error, game_completed
 
     def run_episode(self,
                     instruction: str,
@@ -121,7 +131,7 @@ class ClaudeCodeHarness(ExternalAgentHarness):
 
         # ----- step 2 -----
         # run Claude Code and collect the SDK message stream
-        messages, runtime_error = asyncio.run(
+        messages, runtime_error, game_completed = asyncio.run(
             self.run_episode_async(instruction=instruction,
                                    runtime_model=runtime_model,
                                    runtime_environment=runtime_environment)
@@ -136,7 +146,7 @@ class ClaudeCodeHarness(ExternalAgentHarness):
             "runtime_model": runtime_model,
             "resolved_backend": (self._model_connection or {}).get("backend"),
             "gateway_base_url": runtime_environment.get("ANTHROPIC_BASE_URL"),
-            "success": False,
+            "success": game_completed,
             "session_id": None,
             "duration_ms": None,
             "total_cost_usd": None,
@@ -152,11 +162,6 @@ class ClaudeCodeHarness(ExternalAgentHarness):
 
             if session_id is not None:
                 metadata["session_id"] = session_id
-
-            if getattr(message,
-                       "subtype",
-                       None) == "success":
-                metadata["success"] = True
 
             for field_name in ("duration_ms", "total_cost_usd", "num_turns", "stop_reason"):
                 value = getattr(message,
