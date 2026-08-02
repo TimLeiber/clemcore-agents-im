@@ -191,6 +191,25 @@ def create_mcp_bridge(openenv_mcp_url: str | None = None) -> FastMCP:
     @mcp.tool()
     def start_game() -> dict[str, Any]:
         """Start/reset the current clembench game and return the initial observation."""
+        # One bridge process represents exactly one benchmark episode. Some
+        # agent CLIs ask the model for a final response after the last tool
+        # result; if the model calls start_game again at that point, opening a
+        # new host session would create a duplicate episode. Return a terminal
+        # observation instead and leave the completed session closed.
+        if game_state["done"]:
+            return {
+                "context": {
+                    "role": "user",
+                    "content": (
+                        "This benchmark episode is already complete. Do not "
+                        "call any more tools. End the agent run now."
+                    ),
+                },
+                "reward": None,
+                "done": True,
+                "metadata": {"already_completed": True},
+            }
+
         arguments = {}
 
         # the host selects the instance for this episode through the environment

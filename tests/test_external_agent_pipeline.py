@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 import tempfile
@@ -7,16 +8,111 @@ from pathlib import Path
 from unittest.mock import patch
 
 from clemcore.agents.adapters import model_connection
+from clemcore.agents.adapters.hermes import HermesHarness
 from clemcore.agents.adapters.openclaw import (
     OpenClawHarness,
     _validate_openclaw_model_connection,
 )
-from clemcore.agents.mcp.bridge import OpenEnvMCPClient
+from clemcore.agents.mcp.bridge import OpenEnvMCPClient, create_mcp_bridge
 from clemcore.agents.mcp.server import result_run_dir_name
 from clemcore.agents.run_pipeline.utils import write_agent_trace
 
 
 class TestExternalAgentPipeline(unittest.TestCase):
+    def test_bridge_does_not_start_second_episode_after_done(self):
+        client = unittest.mock.MagicMock()
+        client.call_tool.side_effect = [
+            {"context": {"role": "user", "content": "start"},
+             "reward": None, "done": False, "metadata": {}},
+            {"context": {"role": "user", "content": "finished"},
+             "reward": 1.0, "done": True, "metadata": {}},
+        ]
+
+        with patch(
+            "clemcore.agents.mcp.bridge.OpenEnvMCPClient",
+            return_value=client,
+        ):
+            bridge = create_mcp_bridge("http://example.invalid/mcp")
+
+        async def call_episode_tools():
+            await bridge.call_tool("start_game", {})
+            await bridge.call_tool(
+                "submit_response", {"response": "guess"}
+            )
+            return await bridge.call_tool("start_game", {})
+
+        repeated_start = asyncio.run(call_episode_tools())
+
+        self.assertEqual(client.call_tool.call_count, 2)
+        self.assertTrue(repeated_start.structured_content["done"])
+        self.assertTrue(
+            repeated_start.structured_content["metadata"]["already_completed"]
+        )
+
+    def test_hermes_timeout_is_a_failed_episode_not_an_exception(self):
+        successful_setup = subprocess.CompletedProcess([], 0, "", "")
+        calls = [
+            successful_setup,
+            successful_setup,
+            successful_setup,
+            successful_setup,
+            subprocess.TimeoutExpired(
+                ["hermes", "chat"],
+                1,
+                output="partial Hermes output",
+                stderr="",
+            ),
+        ]
+
+        with patch(
+            "clemcore.agents.adapters.hermes.load_model_connection",
+            return_value=None,
+        ), patch(
+            "clemcore.agents.adapters.hermes.subprocess.run",
+            side_effect=calls,
+        ):
+            result = HermesHarness(model="test-model", timeout=1).run_episode(
+                "Play the game."
+            )
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.metadata["runtime_error"], "Hermes timed out after 1s"
+        )
+
+    def test_hermes_cli_exit_before_game_done_is_not_success(self):
+        successful_setup = subprocess.CompletedProcess([], 0, "", "")
+        incomplete_chat = subprocess.CompletedProcess(
+            [],
+            0,
+            "Tool call: mcp__clem_game__start_game",
+            "",
+        )
+
+        with patch(
+            "clemcore.agents.adapters.hermes.load_model_connection",
+            return_value=None,
+        ), patch(
+            "clemcore.agents.adapters.hermes.subprocess.run",
+            side_effect=[
+                successful_setup,
+                successful_setup,
+                successful_setup,
+                successful_setup,
+                incomplete_chat,
+            ],
+        ):
+            result = HermesHarness(model="test-model").run_episode(
+                "Play the game."
+            )
+
+        self.assertFalse(result.success)
+        self.assertFalse(result.metadata["game_completed"])
+        self.assertEqual(
+            result.metadata["runtime_error"],
+            "Hermes ended before clem_game reported done=true",
+        )
+
     def test_closed_openenv_session_removes_recovery_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             session_path = Path(directory) / "openenv_session.json"

@@ -28,6 +28,7 @@ class HermesHarness(ExternalAgentHarness):
                  mcp_url: str = "http://host.docker.internal:8001/mcp",
                  max_turns: int = 20,
                  yolo: bool = True,
+                 timeout: int = 600,
                  reasoning_effort: str | None = None,
                  model_connection_path: str | None = None):
         """Configure the Hermes harness.
@@ -39,6 +40,7 @@ class HermesHarness(ExternalAgentHarness):
             mcp_url: URL forwarded to the container-side MCP bridge
             max_turns: maximum number of Hermes turns
             yolo: whether to disable Hermes approval gates
+            timeout: maximum duration of one Hermes chat in seconds
             reasoning_effort: model reasoning effort configured in Hermes
             model_connection_path: optional resolved model-connection file
         """
@@ -49,6 +51,7 @@ class HermesHarness(ExternalAgentHarness):
         self.mcp_url = mcp_url
         self.max_turns = max_turns
         self.yolo = yolo
+        self.timeout = timeout
         self.reasoning_effort = reasoning_effort
         self._model_connection = load_model_connection("hermes", model_connection_path)
 
@@ -76,10 +79,12 @@ class HermesHarness(ExternalAgentHarness):
             "provider": self.provider,
             "mcp_url": self.mcp_url,
             "max_turns": self.max_turns,
+            "timeout": self.timeout,
             "reasoning_effort": self.reasoning_effort,
             "success": False,
             "returncode": None,
             "runtime_error": None,
+            "game_completed": False,
             "tool_call_count_hint": 0,
             "hermes_session_id": None,
             "raw_reasoning_available": None,
@@ -173,11 +178,61 @@ class HermesHarness(ExternalAgentHarness):
                                    timeout=30)
                 )
 
-            chat = subprocess.run(chat_command,
-                                  text=True,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE,
-                                  timeout=600)
+            try:
+                chat = subprocess.run(chat_command,
+                                      text=True,
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE,
+                                      timeout=self.timeout)
+            except subprocess.TimeoutExpired as error:
+                def timeout_output(value: str | bytes | None) -> str:
+                    if isinstance(value, bytes):
+                        return value.decode("utf-8", errors="replace")
+                    return value or ""
+
+                partial_stdout = timeout_output(error.stdout)
+                partial_stderr = timeout_output(error.stderr)
+                combined_trace = redact_sensitive("\n".join([
+                    "hermes_mcp_add_command:",
+                    " ".join(register_command),
+                    "hermes_mcp_add_stdout:",
+                    register.stdout,
+                    "hermes_mcp_add_stderr:",
+                    register.stderr,
+                    "hermes_config_commands:",
+                    "\n".join(" ".join(command) for command in config_commands),
+                    "hermes_config_stdout:",
+                    "\n".join(result.stdout for result in config_results),
+                    "hermes_config_stderr:",
+                    "\n".join(result.stderr for result in config_results),
+                    "hermes_chat_command:",
+                    " ".join(chat_command[:-1] + ["<instruction>"]),
+                    "hermes_chat_stdout:",
+                    partial_stdout,
+                    "hermes_chat_stderr:",
+                    partial_stderr,
+                    f"hermes_timeout: {error.timeout}s",
+                ]))
+                metadata["runtime_error"] = (
+                    f"Hermes timed out after {error.timeout}s"
+                )
+                metadata["tool_call_count_hint"] = (
+                    partial_stdout.count("Tool call: mcp__clem_game__")
+                    + partial_stderr.count("Tool call: mcp__clem_game__")
+                )
+                trace_path = write_text_artifact(
+                    output_dir=output_dir,
+                    filename="adapter_messages.txt",
+                    content=combined_trace,
+                )
+                if trace_path is not None:
+                    artifacts["adapter_messages"] = trace_path
+                print(combined_trace)
+                return AgentRunResult(
+                    success=False,
+                    artifacts=artifacts,
+                    metadata=metadata,
+                )
 
         # ----- step 4 -----
         # combine the trace and derive the run outcome
@@ -202,6 +257,15 @@ class HermesHarness(ExternalAgentHarness):
             chat.stderr,
         ]))
         session_text = chat.stdout + "\n" + chat.stderr
+        metadata["game_completed"] = any(
+            marker in session_text
+            for marker in (
+                '"done":true',
+                '"done": true',
+                '\\"done\\":true',
+                '\\"done\\": true',
+            )
+        )
         session_match = re.search(r"^Session:\s*(\S+)",
                                   session_text,
                                   flags=re.MULTILINE)
@@ -221,6 +285,7 @@ class HermesHarness(ExternalAgentHarness):
             register.returncode == 0
             and chat.returncode == 0
             and metadata["tool_call_count_hint"] > 0
+            and metadata["game_completed"]
         )
 
         if register.returncode != 0:
@@ -229,6 +294,10 @@ class HermesHarness(ExternalAgentHarness):
             metadata["runtime_error"] = "hermes chat failed"
         elif metadata["tool_call_count_hint"] <= 0:
             metadata["runtime_error"] = "hermes completed without visible clem_game MCP tool calls"
+        elif not metadata["game_completed"]:
+            metadata["runtime_error"] = (
+                "Hermes ended before clem_game reported done=true"
+            )
 
         # ----- step 5 -----
         # write the trace and export available Hermes session artifacts
