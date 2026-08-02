@@ -28,6 +28,7 @@ class HermesHarness(ExternalAgentHarness):
                  mcp_url: str = "http://host.docker.internal:8001/mcp",
                  max_turns: int = 20,
                  yolo: bool = True,
+                 reasoning_effort: str | None = None,
                  model_connection_path: str | None = None):
         """Configure the Hermes harness.
 
@@ -38,6 +39,7 @@ class HermesHarness(ExternalAgentHarness):
             mcp_url: URL forwarded to the container-side MCP bridge
             max_turns: maximum number of Hermes turns
             yolo: whether to disable Hermes approval gates
+            reasoning_effort: model reasoning effort configured in Hermes
             model_connection_path: optional resolved model-connection file
         """
 
@@ -47,6 +49,7 @@ class HermesHarness(ExternalAgentHarness):
         self.mcp_url = mcp_url
         self.max_turns = max_turns
         self.yolo = yolo
+        self.reasoning_effort = reasoning_effort
         self._model_connection = load_model_connection("hermes", model_connection_path)
 
     def run_episode(self,
@@ -73,6 +76,7 @@ class HermesHarness(ExternalAgentHarness):
             "provider": self.provider,
             "mcp_url": self.mcp_url,
             "max_turns": self.max_turns,
+            "reasoning_effort": self.reasoning_effort,
             "success": False,
             "returncode": None,
             "runtime_error": None,
@@ -124,6 +128,13 @@ class HermesHarness(ExternalAgentHarness):
             ["hermes", "config", "set", "display.streaming", "true"],
             ["hermes", "config", "set", "display.tool_progress", "verbose"],
         ]
+
+        if self.reasoning_effort is not None:
+            config_commands.append([
+                "hermes", "config", "set", "agent.reasoning_effort",
+                self.reasoning_effort,
+            ])
+
         chat_command = [
             "hermes",
             "chat",

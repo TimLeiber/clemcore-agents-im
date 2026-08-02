@@ -72,11 +72,13 @@ class OpenClawHarness(ExternalAgentHarness):
                  profile: str = "clembench-openclaw",
                  yolo: bool = True,
                  debug: bool = False,
+                 reasoning_effort: str | None = None,
                  model_connection_path: str | None = None):
         self.model = model or clem_model
         self.clem_model = clem_model
         self.mcp_url = mcp_url
-        self.thinking = thinking
+        self.thinking = reasoning_effort if reasoning_effort is not None else thinking
+        self.reasoning_effort = self.thinking
         self.verbose = verbose
         self.timeout = timeout
         self.profile = profile
@@ -91,6 +93,7 @@ class OpenClawHarness(ExternalAgentHarness):
         artifacts: dict[str, Path | str | int | float | bool | None] = {}
         metadata: dict[str, Any] = {
             "adapter": "openclaw",
+            "reasoning_effort": self.reasoning_effort,
             "success": False,
             "returncode": None,
             "runtime_error": None,

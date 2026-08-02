@@ -102,9 +102,10 @@ class TestExternalAgentPipeline(unittest.TestCase):
             "clemcore.agents.adapters.openclaw.subprocess.run",
             side_effect=fake_run,
         ), tempfile.TemporaryDirectory() as directory:
-            result = OpenClawHarness(model_connection_path="ignored").run_episode(
-                "Play the game.", output_dir=directory
-            )
+            result = OpenClawHarness(
+                reasoning_effort="medium",
+                model_connection_path="ignored",
+            ).run_episode("Play the game.", output_dir=directory)
 
         config_input = next(
             input_text
@@ -118,16 +119,29 @@ class TestExternalAgentPipeline(unittest.TestCase):
         )
         self.assertEqual(
             config["plugins"],
-            {"enabled": True, "allow": ["openrouter"]},
+            {
+                "enabled": True,
+                "allow": ["openrouter", "duckduckgo", "browser"],
+            },
         )
-        self.assertNotIn("profile", config["tools"])
         self.assertEqual(
-            config["tools"]["allow"],
-            [
-                "clem_game__start_game",
-                "clem_game__submit_response",
-                "clem_game__get_state",
-            ],
+            config["browser"],
+            {"enabled": True, "headless": True, "noSandbox": True},
+        )
+        self.assertEqual(
+            config["tools"]["web"]["search"],
+            {"enabled": True, "provider": "duckduckgo"},
+        )
+        self.assertEqual(
+            config["tools"]["exec"],
+            {"security": "full", "ask": "off"},
+        )
+        agent_command = next(
+            command for command, _input_text in calls if "agent" in command
+        )
+        self.assertEqual(
+            agent_command[agent_command.index("--thinking") + 1],
+            "medium",
         )
         self.assertTrue(result.success)
 

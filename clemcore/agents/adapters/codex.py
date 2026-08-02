@@ -26,6 +26,7 @@ class CodexHarness(ExternalAgentHarness):
                  clem_model: str | None = None,
                  mcp_url: str = "http://host.docker.internal:8001/mcp",
                  sandbox: str = "full_access",
+                 reasoning_effort: str | None = None,
                  model_connection_path: str | None = None):
         """Configure the Codex harness.
 
@@ -34,6 +35,7 @@ class CodexHarness(ExternalAgentHarness):
             clem_model: clembench model resolved by the outer pipeline
             mcp_url: URL forwarded to the container-side MCP bridge
             sandbox: Codex sandbox policy
+            reasoning_effort: model reasoning effort passed to Codex
             model_connection_path: optional resolved model-connection file
         """
 
@@ -41,6 +43,7 @@ class CodexHarness(ExternalAgentHarness):
         self.clem_model = clem_model
         self.mcp_url = mcp_url
         self.sandbox = sandbox
+        self.reasoning_effort = reasoning_effort
         self._model_connection = load_model_connection("codex", model_connection_path)
 
     def run_episode(self,
@@ -93,11 +96,15 @@ class CodexHarness(ExternalAgentHarness):
             'sandbox_mode = "danger-full-access"',
         ]
 
+        if self.reasoning_effort is not None:
+            config_lines.append(
+                f"model_reasoning_effort = {json.dumps(self.reasoning_effort)}"
+            )
+
         if runtime_base_url:
             if "openrouter.ai" in runtime_base_url:
                 config_lines.extend([
                     'model_provider = "openrouter"',
-                    'model_reasoning_effort = "high"',
                     "",
                     "[model_providers.openrouter]",
                     'name = "openrouter"',
@@ -196,6 +203,7 @@ class CodexHarness(ExternalAgentHarness):
             "mcp_url": self.mcp_url,
             "codex_config": str(config_path),
             "sandbox": self.sandbox,
+            "reasoning_effort": self.reasoning_effort,
             "success": False,
             "runtime_error": None,
             "returncode": None,

@@ -28,6 +28,7 @@ class ClaudeCodeHarness(ExternalAgentHarness):
                  max_turns: int = 20,
                  allowed_tools: list[str] | None = None,
                  permission_mode: str = "bypassPermissions",
+                 reasoning_effort: str | None = None,
                  model_connection_path: str | None = None):
         """Configure the Claude Code harness.
 
@@ -36,8 +37,10 @@ class ClaudeCodeHarness(ExternalAgentHarness):
             clem_model: clembench model resolved by the outer pipeline
             mcp_url: URL forwarded to the container-side MCP bridge
             max_turns: maximum number of Claude Code turns
-            allowed_tools: tools Claude Code may call
+            allowed_tools: tool patterns Claude Code pre-approves; this does
+                not replace its built-in tool inventory
             permission_mode: Claude Code tool-permission policy
+            reasoning_effort: model reasoning effort passed to Claude Code
             model_connection_path: optional resolved model-connection file
         """
 
@@ -47,6 +50,7 @@ class ClaudeCodeHarness(ExternalAgentHarness):
         self.max_turns = max_turns
         self.allowed_tools = allowed_tools or ["mcp__clem_game__*"]
         self.permission_mode = permission_mode
+        self.reasoning_effort = reasoning_effort
         self._model_connection = load_model_connection("claude_code", model_connection_path)
 
     async def run_episode_async(self,
@@ -83,6 +87,9 @@ class ClaudeCodeHarness(ExternalAgentHarness):
 
         if runtime_model:
             options_kwargs["model"] = runtime_model
+
+        if self.reasoning_effort is not None:
+            options_kwargs["effort"] = self.reasoning_effort
 
         options = ClaudeAgentOptions(**options_kwargs)
         messages = []
@@ -146,6 +153,7 @@ class ClaudeCodeHarness(ExternalAgentHarness):
             "runtime_model": runtime_model,
             "resolved_backend": (self._model_connection or {}).get("backend"),
             "gateway_base_url": runtime_environment.get("ANTHROPIC_BASE_URL"),
+            "reasoning_effort": self.reasoning_effort,
             "success": game_completed,
             "session_id": None,
             "duration_ms": None,
