@@ -219,20 +219,20 @@ def _rewrite_responses_body(
 class _ProxyServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(
-        self,
-        target_origin: str,
-        completion_path: Path,
-        request_body_overrides: dict[str, Any],
-        verify_tls: bool,
-        upstream_model: str | None,
-    ):
+    def __init__(self,
+                 target_origin: str,
+                 completion_path: Path,
+                 request_body_overrides: dict[str, Any],
+                 verify_tls: bool,
+                 upstream_model: str | None,
+                 trace_responses: bool):
         super().__init__(("127.0.0.1", 0), _ProxyHandler)
         self.target_origin = target_origin
         self.completion_path = completion_path
         self.request_body_overrides = request_body_overrides
         self.verify_tls = verify_tls
         self.upstream_model = upstream_model
+        self.trace_responses = trace_responses
         self.response_trace_lock = threading.Lock()
         self.response_trace_count = 0
 
@@ -242,6 +242,9 @@ class _ProxyServer(ThreadingHTTPServer):
                        content_type: str,
                        content_encoding: str,
                        body: bytes) -> None:
+        if not self.trace_responses:
+            return
+
         response_text = body.decode("utf-8", errors="replace")
 
         with self.response_trace_lock:
@@ -391,14 +394,13 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 class OpenAICompatibleProxy(AbstractContextManager["OpenAICompatibleProxy"]):
     """Local protocol-preserving proxy for OpenAI-compatible model servers."""
 
-    def __init__(
-        self,
-        target_base_url: str,
-        completion_path: Path,
-        request_body_overrides: dict[str, Any] | None = None,
-        verify_tls: bool = True,
-        upstream_model: str | None = None,
-    ):
+    def __init__(self,
+                 target_base_url: str,
+                 completion_path: Path,
+                 request_body_overrides: dict[str, Any] | None = None,
+                 verify_tls: bool = True,
+                 upstream_model: str | None = None,
+                 trace_responses: bool = True):
         parsed = urlsplit(target_base_url)
 
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -412,6 +414,7 @@ class OpenAICompatibleProxy(AbstractContextManager["OpenAICompatibleProxy"]):
             request_body_overrides=request_body_overrides or {},
             verify_tls=verify_tls,
             upstream_model=upstream_model,
+            trace_responses=trace_responses,
         )
         self._thread = threading.Thread(
             target=self._server.serve_forever,
@@ -437,11 +440,16 @@ class OpenAICompatibleProxy(AbstractContextManager["OpenAICompatibleProxy"]):
         self._thread.join(timeout=5)
 
 
-def proxy_for_model_connection(
-    connection: dict[str, Any] | None,
-    completion_path: Path,
-) -> OpenAICompatibleProxy | None:
-    if not connection or connection.get("backend") != "openai_compatible":
+def proxy_for_model_connection(connection: dict[str, Any] | None,
+                               completion_path: Path,
+                               include_openrouter: bool = False,
+                               trace_responses: bool = True) -> OpenAICompatibleProxy | None:
+    if not connection:
+        return None
+
+    backend = connection.get("backend")
+
+    if backend != "openai_compatible" and not (include_openrouter and backend == "openrouter"):
         return None
 
     base_url = connection.get("base_url")
@@ -460,4 +468,5 @@ def proxy_for_model_connection(
         request_body_overrides=overrides,
         verify_tls=bool(connection.get("verify_tls", True)),
         upstream_model=connection.get("model"),
+        trace_responses=trace_responses,
     )

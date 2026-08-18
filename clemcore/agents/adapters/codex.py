@@ -54,7 +54,11 @@ class CodexHarness(ExternalAgentHarness):
                     instruction: str,
                     output_dir: Path | str | None = None) -> AgentRunResult:
         completion_path = new_game_completion_path()
-        proxy = proxy_for_model_connection(self._model_connection, completion_path)
+        resolved_backend = (self._model_connection or {}).get("backend")
+        proxy = proxy_for_model_connection(self._model_connection,
+                                           completion_path,
+                                           include_openrouter=True,
+                                           trace_responses=resolved_backend != "openrouter")
 
         if proxy is not None:
             with proxy:
@@ -87,6 +91,12 @@ class CodexHarness(ExternalAgentHarness):
         runtime_model = resolve_runtime_model(model_connection=self._model_connection,
                                               model=self.model,
                                               harness_name="CodexHarness")
+        resolved_backend = (self._model_connection or {}).get("backend")
+        codex_model = (
+            "clem-openrouter-model"
+            if resolved_backend == "openrouter" and proxied_base_url is not None
+            else runtime_model
+        )
         runtime_environment = model_connection_environment(self._model_connection)
         runtime_base_url = proxied_base_url
 
@@ -126,7 +136,17 @@ class CodexHarness(ExternalAgentHarness):
             )
 
         if runtime_base_url:
-            if "openrouter.ai" in runtime_base_url:
+            if resolved_backend == "openrouter" and proxied_base_url is not None:
+                config_lines.extend([
+                    'model_provider = "openrouter_proxy"',
+                    "",
+                    "[model_providers.openrouter_proxy]",
+                    'name = "openrouter_proxy"',
+                    f"base_url = {json.dumps(runtime_base_url)}",
+                    'env_key = "OPENROUTER_API_KEY"',
+                    'wire_api = "responses"',
+                ])
+            elif "openrouter.ai" in runtime_base_url:
                 config_lines.extend([
                     'model_provider = "openrouter"',
                     "",
@@ -178,7 +198,7 @@ class CodexHarness(ExternalAgentHarness):
             "--strict-config",
             "--json",
             "--model",
-            runtime_model,
+            codex_model,
             "--cd",
             "/workspace",
             "--skip-git-repo-check",
@@ -222,7 +242,8 @@ class CodexHarness(ExternalAgentHarness):
             "model": self.model,
             "clem_model": self.clem_model,
             "runtime_model": runtime_model,
-            "resolved_backend": (self._model_connection or {}).get("backend"),
+            "codex_model": codex_model,
+            "resolved_backend": resolved_backend,
             "gateway_base_url": (
                 (self._model_connection or {}).get("base_url") or runtime_base_url
             ),
@@ -249,6 +270,7 @@ class CodexHarness(ExternalAgentHarness):
             config_path.read_text(encoding="utf-8"),
             f"model: {self.model}",
             f"runtime_model: {runtime_model}",
+            f"codex_model: {codex_model}",
             f"gateway_base_url: {metadata['gateway_base_url']}",
             f"compatibility_proxy_base_url: {proxied_base_url}",
             f"sandbox: {self.sandbox}",

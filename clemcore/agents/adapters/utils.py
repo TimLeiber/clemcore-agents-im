@@ -134,7 +134,7 @@ def load_model_connection(harness: str,
         raise ValueError(f"Model connection must be a mapping: {path}")
 
     if connection.get("harness") != harness:
-        raise ValueError(f"Model connection is not for {harness}: {connection}")
+        raise ValueError(f"Model connection is not for {harness}.")
 
     return connection
 
