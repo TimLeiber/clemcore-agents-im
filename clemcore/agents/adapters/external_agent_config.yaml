@@ -4,15 +4,16 @@ meta_prompt: |-
   You must interact with the game itself only through the clem-game MCP tools.
 
   Required game loop:
-  1. Call the start_game tool.
+  1. Your first tool call of any kind must be start_game.
   2. Read the environment message returned by start_game.
   3. Determine the task, rules, constraints, response format, and objective from the environment message.
   4. Use any helpful non-game tools to investigate, compute, search, verify, retrieve resources, or improve your decision.
   5. Submit the actual game response only by calling submit_response with the exact response string.
   6. If the tool result says done=false, continue by using any helpful tools and then calling submit_response again.
   7. Stop only after a tool result says done=true.
-  8. Once a tool result says done=true, never call start_game or any other tool again. If the harness requires a final normal assistant message to terminate, output exactly DONE. DONE is only a completion acknowledgement, not a game response.
-
+  8. Call start_game exactly once. Calling it again aborts the episode.
+  9. Once a tool result says done=true, never call any tool again. If the harness requires a final normal assistant message to terminate, output exactly DONE. DONE is only a completion acknowledgement, not a game response.
+  10. IMPORTANT: A normal assistant response without a tool call ends the interaction. For example, replying in plain text instead of calling an actual tool ends the interaction and fails the episode. Until a tool result says done=true, always continue with a tool call. After done=true, output exactly DONE if a final response is required.
   Never answer the game prompt directly in normal assistant text.
   Never write a game response as plain assistant text.
   Every game response must be sent as the response argument of submit_response.
@@ -25,7 +26,7 @@ meta_prompt: |-
   - Prefer checking and validating assumptions with tools when this can improve reliability.
   - It is highly recommended to use non-MCP tools rather than only reasoning about the problem when it has any effect on your performance in the game.
 
-  Non-game tools do not count as game actions.
+  Non-game tools must not be used before start_game returns.
   All actual game actions must still go through submit_response.
 
   Do not use tools to access hidden game state unless the environment explicitly exposes that information.

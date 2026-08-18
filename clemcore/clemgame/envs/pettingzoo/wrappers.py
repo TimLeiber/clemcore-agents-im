@@ -57,6 +57,18 @@ class AECToGymWrapper(gymnasium.Env):
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
         """Execute learner's action, iterate through and return the next observation."""
         self.env.step(action)
+
+        # Autoplay can finish the episode before the learner gets control again.
+        # In that case PettingZoo clears agent_selection, so env.last() would assert.
+        if self.env.agent_selection is None:
+            learner_agent = self.learner_agent
+            obs = self.env.observe(learner_agent)
+            reward = self.env.rewards.get(learner_agent, 0.0)
+            done = self.env.terminations.get(learner_agent, True)
+            truncated = self.env.truncations.get(learner_agent, False)
+            info = self.env.infos.get(learner_agent, {})
+            return obs, reward, done, truncated, info
+
         # The downstream call to self.env.step() stops at the learner's turn, so this is its next observation
         obs, reward, done, truncated, info = self.env.last()
         if done or truncated:

@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from clemcore.backends import ModelRegistry
 
@@ -18,6 +19,7 @@ def _model_spec_to_dict(model_spec: Any) -> dict[str, Any]:
         "model_name": getattr(model_spec, "model_name", None),
         "model_id": getattr(model_spec, "model_id", None),
         "backend": getattr(model_spec, "backend", None),
+        "context_size": getattr(model_spec, "context_size", None),
         "model_config": getattr(model_spec, "model_config", None),
     }
 
@@ -195,6 +197,43 @@ def _model_reasoning_enabled(model_spec: dict[str, Any]) -> bool:
     return False
 
 
+def _model_request_body_overrides(model_spec: dict[str, Any]) -> dict[str, Any]:
+    model_config = model_spec.get("model_config") or {}
+
+    if not isinstance(model_config, dict):
+        return {}
+
+    extra_body = model_config.get("extra_body") or {}
+    return dict(extra_body) if isinstance(extra_body, dict) else {}
+
+
+def _openai_compatible_verify_tls(config: dict[str, Any]) -> bool:
+    configured = config.get("verify_tls")
+
+    if isinstance(configured, bool):
+        return configured
+
+    # The Potsdam Jarvis endpoint currently serves a mismatched intermediate
+    # certificate. Keep normal verification for every other custom endpoint.
+    hostname = urlsplit(_openai_compatible_base_url(config)).hostname
+    return hostname != "jarvis.ling.uni-potsdam.de"
+
+
+def _openai_compatible_common(
+    model_spec: dict[str, Any],
+    key_config: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "clem_model": model_spec["model_name"],
+        "backend": "openai_compatible",
+        "model": model_spec.get("model_id") or model_spec.get("model_name"),
+        "display_model": model_spec["model_name"],
+        "base_url": _openai_compatible_base_url(key_config),
+        "verify_tls": _openai_compatible_verify_tls(key_config),
+        "request_body_overrides": _model_request_body_overrides(model_spec),
+    }
+
+
 def _openrouter_anthropic_base_url(config: dict[str, Any]) -> str:
     base_url = str(config.get("base_url") or "https://openrouter.ai/api").rstrip("/")
 
@@ -220,10 +259,25 @@ def resolve_clem_model_for_claude_code(clem_model: str) -> dict[str, Any]:
     model_spec = _find_model_spec(clem_model)
     backend = model_spec.get("backend")
 
+    if backend == "openai_compatible":
+        key_config = _openai_compatible_key_config()
+        connection = _openai_compatible_common(model_spec, key_config)
+        connection.update({
+            "harness": "claude_code",
+            "runtime_model": "claude-sonnet-4-5",
+            "env": {
+                "ANTHROPIC_BASE_URL": connection["base_url"],
+                "ANTHROPIC_AUTH_TOKEN": _openai_compatible_api_key(key_config),
+                "ANTHROPIC_API_KEY": "",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            },
+        })
+        return connection
+
     if backend != "openrouter":
         raise NotImplementedError(
             "MVP limitation: Claude Code registry-model support currently only "
-            f"supports clembench models with backend='openrouter'. "
+            f"supports clembench models with backend='openrouter' or backend='openai_compatible'. "
             f"Model {clem_model!r} has backend={backend!r}."
         )
 
@@ -282,9 +336,21 @@ def resolve_clem_model_for_codex(clem_model: str) -> dict[str, Any]:
             },
         }
 
+    if backend == "openai_compatible":
+        key_config = _openai_compatible_key_config()
+        connection = _openai_compatible_common(model_spec, key_config)
+        connection.update({
+            "harness": "codex",
+            "env": {
+                "OPENAI_API_KEY": _openai_compatible_api_key(key_config),
+            },
+        })
+        return connection
+
     raise NotImplementedError(
         "MVP limitation: Codex registry-model support currently only "
-        f"supports clembench models with backend='openrouter' or backend='openai'. "
+        f"supports clembench models with backend='openrouter', backend='openai', "
+        "or backend='openai_compatible'. "
         f"Model {clem_model!r} has backend={backend!r}."
     )
 
@@ -310,9 +376,22 @@ def resolve_clem_model_for_hermes(clem_model: str) -> dict[str, Any]:
             },
         }
 
+    if backend == "openai_compatible":
+        key_config = _openai_compatible_key_config()
+        connection = _openai_compatible_common(model_spec, key_config)
+        connection.update({
+            "harness": "hermes",
+            "provider": "openai-api",
+            "env": {
+                "OPENAI_BASE_URL": connection["base_url"],
+                "OPENAI_API_KEY": _openai_compatible_api_key(key_config),
+            },
+        })
+        return connection
+
     raise NotImplementedError(
         "MVP limitation: Hermes registry-model support currently only "
-        f"supports clembench models with backend='openrouter'. "
+        f"supports clembench models with backend='openrouter' or backend='openai_compatible'. "
         f"Model {clem_model!r} has backend={backend!r}."
     )
 
@@ -345,10 +424,12 @@ def resolve_clem_model_for_openclaw(clem_model: str) -> dict[str, Any]:
         provider_name = "clem_openai_compatible"
         api_key_env = "CLEM_OPENAI_COMPATIBLE_API_KEY"
         runtime_model = f"{provider_name}/{model_id}"
+        common = _openai_compatible_common(model_spec, key_config)
 
         model_definition: dict[str, Any] = {
             "id": model_id,
             "name": model_spec["model_name"],
+            "api": "openai-completions",
             "reasoning": _model_reasoning_enabled(model_spec),
             "input": ["text"],
         }
@@ -394,11 +475,10 @@ def resolve_clem_model_for_openclaw(clem_model: str) -> dict[str, Any]:
         model_definition["maxTokens"] = 8192
 
         return {
+            **common,
             "harness": "openclaw",
-            "clem_model": model_spec["model_name"],
-            "backend": "openai_compatible",
-            "model": runtime_model,
-            "display_model": model_spec["model_name"],
+            "runtime_model": runtime_model,
+            "openclaw_provider": provider_name,
             "env": {
                 api_key_env: _openai_compatible_api_key(key_config),
             },
@@ -407,7 +487,7 @@ def resolve_clem_model_for_openclaw(clem_model: str) -> dict[str, Any]:
                     "mode": "merge",
                     "providers": {
                         provider_name: {
-                            "baseUrl": _openai_compatible_base_url(key_config),
+                            "baseUrl": common["base_url"],
                             "apiKey": f"${{{api_key_env}}}",
                             "api": "openai-completions",
                             "models": [

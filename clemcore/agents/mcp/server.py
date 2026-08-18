@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 import uvicorn
 
@@ -53,7 +54,8 @@ def run_clem_mcp_server(game_name: str,
                         gen_args: dict | None = None,
                         results_dir: str | Path | None = None,
                         run_dir: str | None = None,
-                        port: int = 8001) -> None:
+                        port: int = 8001,
+                        quiet: bool = False) -> None:
     """Create and run the host-side MCP server for a clembench run.
 
     The server wraps the selected clembench game as an OpenEnv environment and
@@ -75,7 +77,11 @@ def run_clem_mcp_server(game_name: str,
         results_dir: root directory where clembench writes results
         run_dir: optional explicit name for the dialogue-pair result directory
         port: port used by the MCP server
+        quiet: whether to suppress informational server logging
         """
+
+    if quiet:
+        logging.disable(logging.INFO)
 
     # ----- step 1 -----
     # derive the result directory name from the configured players when omitted

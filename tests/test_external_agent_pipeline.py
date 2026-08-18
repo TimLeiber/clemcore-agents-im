@@ -1,32 +1,48 @@
 import asyncio
 import json
+import sys
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from unittest.mock import patch
 
+import requests
+
 from clemcore.agents.adapters import model_connection
+from clemcore.agents.adapters.claude_code import _anthropic_proxy_base_url
 from clemcore.agents.adapters.hermes import HermesHarness
+from clemcore.agents.adapters.openai_compatible_proxy import (
+    OpenAICompatibleProxy,
+    _resolve_namespaced_tool,
+)
 from clemcore.agents.adapters.openclaw import (
     OpenClawHarness,
     _validate_openclaw_model_connection,
 )
-from clemcore.agents.mcp.bridge import OpenEnvMCPClient, create_mcp_bridge
+from clemcore.agents.mcp.bridge import (
+    CONTROL_FAILURE_RESPONSE,
+    OpenEnvMCPClient,
+    create_mcp_bridge,
+)
 from clemcore.agents.mcp.server import result_run_dir_name
 from clemcore.agents.run_pipeline.utils import write_agent_trace
+from clemcore.agents.adapters.utils import run_process_until_game_complete
 
 
 class TestExternalAgentPipeline(unittest.TestCase):
-    def test_bridge_does_not_start_second_episode_after_done(self):
+    def test_claude_proxy_base_does_not_duplicate_v1(self):
+        self.assertEqual(
+            _anthropic_proxy_base_url("http://127.0.0.1:1234/api/v1"),
+            "http://127.0.0.1:1234/api",
+        )
+
+    def test_bridge_exposes_start_and_submit_without_get_state(self):
         client = unittest.mock.MagicMock()
-        client.call_tool.side_effect = [
-            {"context": {"role": "user", "content": "start"},
-             "reward": None, "done": False, "metadata": {}},
-            {"context": {"role": "user", "content": "finished"},
-             "reward": 1.0, "done": True, "metadata": {}},
-        ]
 
         with patch(
             "clemcore.agents.mcp.bridge.OpenEnvMCPClient",
@@ -34,20 +50,108 @@ class TestExternalAgentPipeline(unittest.TestCase):
         ):
             bridge = create_mcp_bridge("http://example.invalid/mcp")
 
-        async def call_episode_tools():
-            await bridge.call_tool("start_game", {})
-            await bridge.call_tool(
-                "submit_response", {"response": "guess"}
-            )
-            return await bridge.call_tool("start_game", {})
+        tools = asyncio.run(bridge.list_tools())
 
-        repeated_start = asyncio.run(call_episode_tools())
-
-        self.assertEqual(client.call_tool.call_count, 2)
-        self.assertTrue(repeated_start.structured_content["done"])
-        self.assertTrue(
-            repeated_start.structured_content["metadata"]["already_completed"]
+        self.assertEqual(
+            [tool.name for tool in tools], ["start_game", "submit_response"]
         )
+
+    def test_bridge_aborts_repeated_start_game(self):
+        client = unittest.mock.MagicMock()
+        client.call_tool.side_effect = [
+            {"context": {}, "reward": None, "done": False, "metadata": {}},
+            {"context": {}, "reward": -1.0, "done": False, "metadata": {}},
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            completion_path = Path(directory) / "completed.json"
+
+            with patch(
+                "clemcore.agents.mcp.bridge.OpenEnvMCPClient",
+                return_value=client,
+            ), patch.dict(
+                "os.environ",
+                {"CLEM_GAME_COMPLETION_PATH": str(completion_path)},
+            ):
+                bridge = create_mcp_bridge("http://example.invalid/mcp")
+
+                async def repeat_start_game():
+                    await bridge.call_tool("start_game", {})
+                    return await bridge.call_tool("start_game", {})
+
+                result = asyncio.run(repeat_start_game())
+
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.structured_content["done"])
+        self.assertEqual(
+            client.call_tool.call_args_list,
+            [
+                unittest.mock.call("start_game", {}),
+                unittest.mock.call(
+                    "submit_response", {"response": CONTROL_FAILURE_RESPONSE}
+                ),
+            ],
+        )
+        client.close_session.assert_called_once_with()
+        self.assertTrue(completion["done"])
+        self.assertTrue(completion["control_failure"])
+
+    def test_bridge_aborts_submit_response_before_start_game(self):
+        client = unittest.mock.MagicMock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            completion_path = Path(directory) / "completed.json"
+
+            with patch(
+                "clemcore.agents.mcp.bridge.OpenEnvMCPClient",
+                return_value=client,
+            ), patch.dict(
+                "os.environ",
+                {"CLEM_GAME_COMPLETION_PATH": str(completion_path)},
+            ):
+                bridge = create_mcp_bridge("http://example.invalid/mcp")
+                result = asyncio.run(
+                    bridge.call_tool("submit_response", {"response": "guess"})
+                )
+
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result.structured_content["done"])
+        self.assertTrue(result.structured_content["metadata"]["start_game_required"])
+        client.call_tool.assert_not_called()
+        self.assertTrue(completion["control_failure"])
+
+    def test_bridge_writes_completion_marker(self):
+        client = unittest.mock.MagicMock()
+        client.call_tool.side_effect = [
+            {"context": {}, "reward": None, "done": False, "metadata": {}},
+            {"context": {}, "reward": 1.0, "done": True, "metadata": {}},
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            completion_path = Path(directory) / "completed.json"
+
+            with patch(
+                "clemcore.agents.mcp.bridge.OpenEnvMCPClient",
+                return_value=client,
+            ), patch.dict(
+                "os.environ",
+                {"CLEM_GAME_COMPLETION_PATH": str(completion_path)},
+            ):
+                bridge = create_mcp_bridge("http://example.invalid/mcp")
+
+                async def finish_game():
+                    await bridge.call_tool("start_game", {})
+                    await bridge.call_tool("submit_response", {"response": "guess"})
+
+                asyncio.run(finish_game())
+
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(completion["done"])
+        self.assertFalse(completion["control_failure"])
+        self.assertEqual(completion["reward"], 1.0)
 
     def test_hermes_timeout_is_a_failed_episode_not_an_exception(self):
         successful_setup = subprocess.CompletedProcess([], 0, "", "")
@@ -56,12 +160,6 @@ class TestExternalAgentPipeline(unittest.TestCase):
             successful_setup,
             successful_setup,
             successful_setup,
-            subprocess.TimeoutExpired(
-                ["hermes", "chat"],
-                1,
-                output="partial Hermes output",
-                stderr="",
-            ),
         ]
 
         with patch(
@@ -70,6 +168,14 @@ class TestExternalAgentPipeline(unittest.TestCase):
         ), patch(
             "clemcore.agents.adapters.hermes.subprocess.run",
             side_effect=calls,
+        ), patch(
+            "clemcore.agents.adapters.hermes.run_process_until_game_complete",
+            side_effect=subprocess.TimeoutExpired(
+                ["hermes", "chat"],
+                1,
+                output="partial Hermes output",
+                stderr="",
+            ),
         ):
             result = HermesHarness(model="test-model", timeout=1).run_episode(
                 "Play the game."
@@ -99,8 +205,10 @@ class TestExternalAgentPipeline(unittest.TestCase):
                 successful_setup,
                 successful_setup,
                 successful_setup,
-                incomplete_chat,
             ],
+        ), patch(
+            "clemcore.agents.adapters.hermes.run_process_until_game_complete",
+            return_value=(incomplete_chat, False),
         ):
             result = HermesHarness(model="test-model").run_episode(
                 "Play the game."
@@ -178,6 +286,340 @@ class TestExternalAgentPipeline(unittest.TestCase):
             {"OPENROUTER_API_KEY": "openrouter-test-key"},
         )
 
+    def test_all_harnesses_resolve_openai_compatible_models(self):
+        model_spec = {
+            "model_name": "Qwen-test-without-reasoning",
+            "backend": "openai_compatible",
+            "model_id": "Qwen/Qwen-test",
+            "context_size": "128k",
+            "model_config": {
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            },
+        }
+        key_config = {
+            "api_key": "jarvis-test-key",
+            "base_url": "https://jarvis.ling.uni-potsdam.de/api/v1",
+        }
+
+        with patch.object(
+            model_connection, "_find_model_spec", return_value=model_spec
+        ), patch.object(
+            model_connection, "_openai_compatible_key_config", return_value=key_config
+        ):
+            connections = {
+                "claude_code": model_connection.resolve_clem_model_for_claude_code(
+                    model_spec["model_name"]
+                ),
+                "codex": model_connection.resolve_clem_model_for_codex(
+                    model_spec["model_name"]
+                ),
+                "hermes": model_connection.resolve_clem_model_for_hermes(
+                    model_spec["model_name"]
+                ),
+                "openclaw": model_connection.resolve_clem_model_for_openclaw(
+                    model_spec["model_name"]
+                ),
+            }
+
+        for harness, connection in connections.items():
+            self.assertEqual(connection["harness"], harness)
+            self.assertEqual(connection["backend"], "openai_compatible")
+            self.assertNotIn("tool_choice", connection)
+            self.assertFalse(connection["verify_tls"])
+            self.assertEqual(
+                connection["request_body_overrides"],
+                {"chat_template_kwargs": {"enable_thinking": False}},
+            )
+
+        self.assertEqual(connections["hermes"]["provider"], "openai-api")
+        self.assertEqual(connections["claude_code"]["runtime_model"], "claude-sonnet-4-5")
+        self.assertEqual(connections["claude_code"]["model"], "Qwen/Qwen-test")
+        self.assertEqual(
+            connections["openclaw"]["openclaw_provider"],
+            "clem_openai_compatible",
+        )
+
+    def test_proxy_preserves_harness_tool_choice(self):
+        received = []
+
+        class UpstreamHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append((self.path, json.loads(self.rfile.read(length))))
+                response = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, format, *args):
+                return
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        upstream_thread = Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                completion_path = Path(directory) / "done.json"
+                target = f"http://127.0.0.1:{upstream.server_port}/api/v1"
+
+                with OpenAICompatibleProxy(
+                    target,
+                    completion_path,
+                    {"chat_template_kwargs": {"enable_thinking": False}},
+                ) as proxy:
+                    openai_body = {
+                        "model": "qwen",
+                        "tools": [{"type": "function", "function": {"name": "start_game"}}],
+                        "tool_choice": "auto",
+                    }
+                    requests.post(
+                        f"{proxy.base_url}/chat/completions",
+                        json=openai_body,
+                        timeout=5,
+                    ).raise_for_status()
+                    requests.post(
+                        f"{proxy.base_url}/messages",
+                        json={
+                            "model": "qwen",
+                            "tools": openai_body["tools"],
+                        },
+                        timeout=5,
+                    ).raise_for_status()
+
+                    completion_path.write_text('{"done":true}', encoding="utf-8")
+                    requests.post(
+                        f"{proxy.base_url}/chat/completions",
+                        json=openai_body,
+                        timeout=5,
+                    ).raise_for_status()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+        self.assertEqual(received[0][0], "/api/v1/chat/completions")
+        self.assertEqual(received[0][1]["tool_choice"], "auto")
+        self.assertEqual(
+            received[0][1]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+        self.assertNotIn("tool_choice", received[1][1])
+        self.assertEqual(received[2][1]["tool_choice"], "auto")
+
+    def test_proxy_rewrites_model_for_anthropic_messages(self):
+        received = []
+
+        class UpstreamHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append((self.path, json.loads(self.rfile.read(length))))
+                response = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, format, *args):
+                return
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        upstream_thread = Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                completion_path = Path(directory) / "done.json"
+                target = f"http://127.0.0.1:{upstream.server_port}/api/v1"
+
+                with OpenAICompatibleProxy(
+                    target,
+                    completion_path,
+                    {"chat_template_kwargs": {"enable_thinking": False}},
+                    upstream_model="Qwen/Qwen3.6-35B-A3B-FP8",
+                ) as proxy:
+                    payload = {
+                        "model": "claude-sonnet-4-5",
+                        "tools": [{"type": "function", "function": {"name": "start_game"}}],
+                    }
+                    requests.post(
+                        f"{proxy.base_url}/messages",
+                        json=payload,
+                        timeout=5,
+                    ).raise_for_status()
+                    requests.post(
+                        f"{proxy.base_url}/chat/completions",
+                        json=payload,
+                        timeout=5,
+                    ).raise_for_status()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+        self.assertEqual(
+            received[0][1]["model"],
+            "Qwen/Qwen3.6-35B-A3B-FP8",
+        )
+        self.assertNotIn("chat_template_kwargs", received[0][1])
+        self.assertEqual(
+            received[1][1]["model"],
+            "Qwen/Qwen3.6-35B-A3B-FP8",
+        )
+        self.assertEqual(
+            received[1][1]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+    def test_proxy_flattens_responses_namespaces_and_restores_tool_calls(self):
+        received = []
+
+        class UpstreamHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                received.append(json.loads(self.rfile.read(length)))
+                flat_name = "mcp__clem_game__start_game"
+                events = [
+                    "event: response.output_item.done\n"
+                    "data: " + json.dumps({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "name": flat_name,
+                            "arguments": "{}",
+                            "call_id": "call_1",
+                            "status": "completed",
+                        },
+                    }) + "\n\n",
+                    "event: response.completed\n"
+                    "data: " + json.dumps({
+                        "type": "response.completed",
+                        "response": {
+                            "status": "completed",
+                            "output": [{
+                                "type": "function_call",
+                                "name": flat_name,
+                                "arguments": "{}",
+                                "call_id": "call_1",
+                                "status": "completed",
+                            }],
+                        },
+                    }) + "\n\n",
+                ]
+                response = "".join(events).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, format, *args):
+                return
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+        upstream_thread = Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                completion_path = Path(directory) / "done.json"
+                target = f"http://127.0.0.1:{upstream.server_port}/api/v1"
+
+                with OpenAICompatibleProxy(target, completion_path) as proxy:
+                    response = requests.post(
+                        f"{proxy.base_url}/responses",
+                        json={
+                            "model": "qwen",
+                            "input": [{
+                                "type": "function_call",
+                                "name": "start_game",
+                                "namespace": "mcp__clem_game__",
+                                "arguments": "{}",
+                                "call_id": "previous_call",
+                            }],
+                            "tools": [{
+                                "type": "namespace",
+                                "name": "mcp__clem_game__",
+                                "description": "Game tools",
+                                "tools": [{
+                                    "type": "function",
+                                    "name": "start_game",
+                                    "description": "Start the game",
+                                    "strict": False,
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {},
+                                    },
+                                }],
+                            }],
+                            "stream": True,
+                        },
+                        timeout=5,
+                    )
+                    response.raise_for_status()
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            upstream_thread.join(timeout=5)
+
+        self.assertEqual(
+            received[0]["tools"][0]["name"],
+            "mcp__clem_game__start_game",
+        )
+        self.assertEqual(received[0]["tools"][0]["type"], "function")
+        self.assertEqual(
+            received[0]["input"][0]["name"],
+            "mcp__clem_game__start_game",
+        )
+        self.assertNotIn("namespace", received[0]["input"][0])
+
+        data_events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        calls = [
+            data_events[0]["item"],
+            data_events[1]["response"]["output"][0],
+        ]
+
+        for call in calls:
+            self.assertEqual(call["name"], "start_game")
+            self.assertEqual(call["namespace"], "mcp__clem_game__")
+
+        namespace_map = {
+            "mcp__clem_game__start_game": ("mcp__clem_game__", "start_game")
+        }
+        self.assertIsNone(_resolve_namespaced_tool("start_game", namespace_map))
+        self.assertIsNone(
+            _resolve_namespaced_tool("mcp.clem_game.start_game", namespace_map)
+        )
+
+    def test_process_is_terminated_after_game_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            completion_path = Path(directory) / "done.json"
+            script = (
+                "from pathlib import Path; import time; "
+                f"Path({str(completion_path)!r}).write_text('{{\"done\":true}}'); "
+                "time.sleep(30)"
+            )
+            started_at = time.monotonic()
+            result, terminated = run_process_until_game_complete(
+                [sys.executable, "-c", script],
+                completion_path=completion_path,
+                completion_grace=0.01,
+                timeout=5,
+            )
+
+        self.assertTrue(terminated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started_at, 2)
+
     def test_openclaw_writes_openrouter_key_into_native_config(self):
         connection = {
             "backend": "openrouter",
@@ -188,8 +630,15 @@ class TestExternalAgentPipeline(unittest.TestCase):
 
         def fake_run(command, **kwargs):
             calls.append((command, kwargs.get("input")))
-            stdout = '"start_game"' if "agent" in command else ""
-            return subprocess.CompletedProcess(command, 0, stdout, "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def fake_agent_run(command, **kwargs):
+            calls.append((command, None))
+            kwargs["completion_path"].write_text(
+                '{"done":true,"control_failure":false}',
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, '"submit_response"', ""), False
 
         with patch(
             "clemcore.agents.adapters.openclaw.load_model_connection",
@@ -197,6 +646,9 @@ class TestExternalAgentPipeline(unittest.TestCase):
         ), patch(
             "clemcore.agents.adapters.openclaw.subprocess.run",
             side_effect=fake_run,
+        ), patch(
+            "clemcore.agents.adapters.openclaw.run_process_until_game_complete",
+            side_effect=fake_agent_run,
         ), tempfile.TemporaryDirectory() as directory:
             result = OpenClawHarness(
                 reasoning_effort="medium",

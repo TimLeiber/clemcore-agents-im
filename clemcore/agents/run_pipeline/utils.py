@@ -73,6 +73,7 @@ def start_server(game_name: str,
                  agent_name: str,
                  agent_player: str,
                  env_agent_models: list[str],
+                 gen_args: dict | None,
                  instances_filename: str | None,
                  results_dir: str) -> Process:
 
@@ -83,6 +84,7 @@ def start_server(game_name: str,
         agent_name: Name of the external agent
         agent_player: Player slot controlled by the external agent
         env_agent_models: Native models assigned to the remaining player slots
+        gen_args: Optional generation arguments for native models
         instances_filename: Optional alternative game instances filename
         results_dir: Root directory where clembench writes results
 
@@ -112,11 +114,13 @@ def start_server(game_name: str,
             "env_agents": _env_agents_from_models(models=env_agent_models,
                                                   learner_agent=agent_player,
                                                   game_name=game_name),
+            "gen_args": gen_args,
             "game_instance_split": None,
             "instances_filename": instances_filename,
             "single_pass": False,
             "results_dir": results_dir,
             "port": SERVER_PORT,
+            "quiet": True,
         },
     )
     # start the process
@@ -257,9 +261,8 @@ def run_docker_episode(experiment_name: str,
 
         assert process.stdout is not None
 
-        # print and collect the container output
+        # collect the container output
         for line in process.stdout:
-            print(line, end="")
             trace_lines.append(line)
 
         return_code = process.wait()
@@ -272,8 +275,6 @@ def run_docker_episode(experiment_name: str,
                 command,
                 output=trace_text,
             )
-
-        return trace_text, return_code
 
     finally:
         # recover an unfinished openenv session
@@ -297,23 +298,25 @@ def run_docker_episode(experiment_name: str,
 
                         try:
                             result = client.call_tool("submit_response",{"response": CONTROL_FAILURE_RESPONSE})
-                            print(f"openenv_control_failure_submitted: "
-                                  f"session_id={session_id} done={result.get('done')}")
+                            trace_lines.append(f"openenv_control_failure_submitted: "
+                                               f"session_id={session_id} done={result.get('done')}\n")
                         except Exception as error:
-                            print(f"openenv_control_failure_failed: "
-                                  f"session_id={session_id} error={error}")
+                            trace_lines.append(f"openenv_control_failure_failed: "
+                                               f"session_id={session_id} error={error}\n")
 
                         try:
                             client.close_session()
-                            print(f"openenv_session_closed: {session_id}")
+                            trace_lines.append(f"openenv_session_closed: {session_id}\n")
                         except Exception as error:
-                            print(f"openenv_session_close_failed: "
-                                  f"session_id={session_id} error={error}")
+                            trace_lines.append(f"openenv_session_close_failed: "
+                                               f"session_id={session_id} error={error}\n")
 
                 except (OSError, json.JSONDecodeError) as error:
-                    print(f"openenv_session_file_invalid: path={session_path} error={error}")
+                    trace_lines.append(f"openenv_session_file_invalid: path={session_path} error={error}\n")
                 except Exception as error:
-                    print(f"openenv_session_cleanup_failed: path={session_path} error={error}")
+                    trace_lines.append(f"openenv_session_cleanup_failed: path={session_path} error={error}\n")
+
+    return "".join(trace_lines), return_code
 
 
 def write_agent_trace(results_dir: str,

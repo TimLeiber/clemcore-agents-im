@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from clemcore.clemgame.envs.pettingzoo.master import GameMasterEnv
+from clemcore.clemgame.envs.pettingzoo.wrappers import AECToGymWrapper
 from clemcore.clemgame.master import GameState, Outcome
 
 
@@ -119,6 +120,38 @@ class GameMasterEnvStepRewardsTestCase(unittest.TestCase):
         env.step("crane")
 
         self.assertAlmostEqual(env._cumulative_rewards["player_0"], 0.6)
+
+
+class AECToGymWrapperTerminalStepTestCase(unittest.TestCase):
+    """Regression tests for learner steps that end during autoplay cleanup."""
+
+    def test_step_handles_terminal_env_without_next_agent(self):
+        mock_env = MagicMock()
+        mock_env.learner_agent = "player_0"
+        mock_env.observation_space.return_value = "obs_space"
+        mock_env.action_space.return_value = "action_space"
+        mock_env.agent_selection = "player_0"
+        mock_env.observe.return_value = {"role": "user", "content": "The game ended."}
+        mock_env.rewards = {"player_0": 1.0}
+        mock_env.terminations = {"player_0": True}
+        mock_env.truncations = {"player_0": False}
+        mock_env.infos = {"player_0": {"terminal": True}}
+
+        def terminal_step(_action):
+            mock_env.agent_selection = None
+
+        mock_env.step.side_effect = terminal_step
+
+        wrapper = AECToGymWrapper(mock_env)
+
+        obs, reward, done, truncated, info = wrapper.step("action")
+
+        self.assertEqual(obs, {"role": "user", "content": "The game ended."})
+        self.assertEqual(reward, 1.0)
+        self.assertTrue(done)
+        self.assertFalse(truncated)
+        self.assertEqual(info, {"terminal": True})
+        mock_env.last.assert_not_called()
 
 
 if __name__ == '__main__':

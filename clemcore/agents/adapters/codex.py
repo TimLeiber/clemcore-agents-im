@@ -4,11 +4,15 @@ import subprocess
 from pathlib import Path
 
 from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
+from clemcore.agents.adapters.openai_compatible_proxy import proxy_for_model_connection
 from clemcore.agents.adapters.utils import (
     load_model_connection,
     mcp_environment,
     model_connection_environment,
+    new_game_completion_path,
+    read_game_completion,
     resolve_runtime_model,
+    run_process_until_game_complete,
     temporary_environment,
     write_text_artifact,
 )
@@ -49,6 +53,25 @@ class CodexHarness(ExternalAgentHarness):
     def run_episode(self,
                     instruction: str,
                     output_dir: Path | str | None = None) -> AgentRunResult:
+        completion_path = new_game_completion_path()
+        proxy = proxy_for_model_connection(self._model_connection, completion_path)
+
+        if proxy is not None:
+            with proxy:
+                return self._run_episode(
+                    instruction,
+                    output_dir,
+                    completion_path,
+                    proxy.base_url,
+                )
+
+        return self._run_episode(instruction, output_dir, completion_path, None)
+
+    def _run_episode(self,
+                     instruction: str,
+                     output_dir: Path | str | None,
+                     completion_path: Path,
+                     proxied_base_url: str | None) -> AgentRunResult:
         """Run one Codex episode.
 
         Args:
@@ -65,9 +88,9 @@ class CodexHarness(ExternalAgentHarness):
                                               model=self.model,
                                               harness_name="CodexHarness")
         runtime_environment = model_connection_environment(self._model_connection)
-        runtime_base_url = None
+        runtime_base_url = proxied_base_url
 
-        if self._model_connection and self._model_connection.get("base_url"):
+        if runtime_base_url is None and self._model_connection and self._model_connection.get("base_url"):
             runtime_base_url = str(self._model_connection["base_url"])
 
         sandbox_modes = {
@@ -88,6 +111,7 @@ class CodexHarness(ExternalAgentHarness):
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "config.toml"
         bridge_environment = mcp_environment(self.mcp_url, include_pythonpath=True)
+        bridge_environment["CLEM_GAME_COMPLETION_PATH"] = str(completion_path)
         environment_lines = "\n".join(
             f"{key} = {json.dumps(value)}" for key, value in sorted(bridge_environment.items())
         )
@@ -131,7 +155,7 @@ class CodexHarness(ExternalAgentHarness):
             "tool_timeout_sec = 120",
             "enabled = true",
             "required = true",
-            'enabled_tools = ["start_game", "submit_response", "get_state"]',
+            'enabled_tools = ["start_game", "submit_response"]',
             'default_tools_approval_mode = "approve"',
             "",
             "[mcp_servers.clem_game.env]",
@@ -199,7 +223,15 @@ class CodexHarness(ExternalAgentHarness):
             "clem_model": self.clem_model,
             "runtime_model": runtime_model,
             "resolved_backend": (self._model_connection or {}).get("backend"),
-            "gateway_base_url": runtime_base_url,
+            "gateway_base_url": (
+                (self._model_connection or {}).get("base_url") or runtime_base_url
+            ),
+            "compatibility_proxy_base_url": proxied_base_url,
+            "tool_choice": (self._model_connection or {}).get("tool_choice"),
+            "request_body_overrides": (
+                (self._model_connection or {}).get("request_body_overrides") or {}
+            ),
+            "verify_tls": (self._model_connection or {}).get("verify_tls"),
             "mcp_url": self.mcp_url,
             "codex_config": str(config_path),
             "sandbox": self.sandbox,
@@ -208,6 +240,8 @@ class CodexHarness(ExternalAgentHarness):
             "runtime_error": None,
             "returncode": None,
             "final_response": None,
+            "game_completed": False,
+            "terminated_after_game": False,
         }
         transcript = [
             f"codex_config: {config_path}",
@@ -215,7 +249,8 @@ class CodexHarness(ExternalAgentHarness):
             config_path.read_text(encoding="utf-8"),
             f"model: {self.model}",
             f"runtime_model: {runtime_model}",
-            f"gateway_base_url: {runtime_base_url}",
+            f"gateway_base_url: {metadata['gateway_base_url']}",
+            f"compatibility_proxy_base_url: {proxied_base_url}",
             f"sandbox: {self.sandbox}",
             "codex_mcp_list_returncode:",
             str(mcp_list_returncode),
@@ -229,16 +264,15 @@ class CodexHarness(ExternalAgentHarness):
 
         try:
             with temporary_environment(runtime_environment):
-                completed = subprocess.run(command,
-                                           input=instruction,
-                                           text=True,
-                                           stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE,
-                                           cwd="/workspace",
-                                           check=False)
+                completed, terminated_after_game = run_process_until_game_complete(
+                    command,
+                    completion_path=completion_path,
+                    input_text=instruction,
+                    cwd="/workspace",
+                )
 
             metadata["returncode"] = completed.returncode
-            metadata["success"] = completed.returncode == 0
+            metadata["terminated_after_game"] = terminated_after_game
             transcript.extend([
                 "codex_stdout_jsonl:",
                 completed.stdout,
@@ -254,6 +288,17 @@ class CodexHarness(ExternalAgentHarness):
             metadata["runtime_error"] = str(error)
             transcript.append(f"agent_runtime_error: {error}")
             print(f"agent_runtime_error: {error}")
+
+        completion = read_game_completion(completion_path)
+        metadata["game_completed"] = bool(
+            completion
+            and completion.get("done") is True
+            and completion.get("control_failure") is not True
+        )
+        metadata["success"] = metadata["game_completed"]
+
+        if metadata["runtime_error"] is None and not metadata["game_completed"]:
+            metadata["runtime_error"] = "Codex ended before clem_game reported done=true"
 
         # ----- step 6 -----
         # write the trace and generated configuration

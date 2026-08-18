@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 
+from tqdm import tqdm
+
 from clemcore.agents.mcp.server import result_run_dir_name
 
 # import all functions from utils needed to run main
@@ -55,6 +57,16 @@ def main() -> None:
                         "--results_dir",
                         default="results/external-agents",
                         help="Results root directory, matching clem run -r style.")
+    parser.add_argument("-t",
+                        "--temperature",
+                        type=float,
+                        default=0.0,
+                        help="Sampling temperature for native clem models, matching clem run -t.")
+    parser.add_argument("-l",
+                        "--max_tokens",
+                        type=int,
+                        default=300,
+                        help="Maximum output tokens for native clem models, matching clem run -l.")
     parser.add_argument("--max-instances",
                         type=int,
                         default=None,
@@ -117,6 +129,10 @@ def main() -> None:
         agent_name=args.agent,
         agent_player=args.agent_player,
         env_agent_models=args.models,
+        gen_args={
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+        },
         instances_filename=args.instances_filename,
         results_dir=args.results_dir,
     )
@@ -128,19 +144,15 @@ def main() -> None:
 
         if args.max_instances is not None:
             selected_instances = list(islice(game_instances, args.max_instances))
-            total = len(selected_instances)
 
         # run each selected game instance
-        for index, row in enumerate(selected_instances, start=1):
+        for row in tqdm(selected_instances, desc="Playing game instances"):
             experiment = row["experiment"]
             game_instance = row["game_instance"]
 
             experiment_name = experiment["name"]
             game_id = game_instance["game_id"]
             target = game_instance.get("target_word") or game_instance.get("target")
-
-            print()
-            print(f"[{index}/{total}] {experiment_name} / game_id={game_id} / target={target}")
 
             # record the episode directories that exist before this run
             before_episode_dirs = {path
@@ -169,7 +181,7 @@ def main() -> None:
 
             # ----- main step 4 -----
             # write the captured trace and metadata
-            trace_path = write_agent_trace(
+            write_agent_trace(
                 results_dir=args.results_dir,
                 run_dir=result_run_dir,
                 game_name=args.game,
@@ -192,8 +204,6 @@ def main() -> None:
                     "finished_at": finished_at.isoformat(),
                 },
             )
-
-            print(f"agent_trace: {trace_path}")
 
 
     finally:

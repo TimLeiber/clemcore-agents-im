@@ -6,13 +6,17 @@ from pathlib import Path
 from typing import Any
 
 from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
+from clemcore.agents.adapters.openai_compatible_proxy import proxy_for_model_connection
 from clemcore.agents.adapters.utils import (
     deep_merge_dicts,
     load_model_connection,
     mcp_environment,
     model_connection_environment,
+    new_game_completion_path,
+    read_game_completion,
     redact_sensitive,
     resolve_runtime_model,
+    run_process_until_game_complete,
     temporary_environment,
     write_text_artifact,
 )
@@ -24,10 +28,8 @@ GAME_TOOL_MARKERS = (
     "mcp_clem_game_",
     "clem_game.start_game",
     "clem_game.submit_response",
-    "clem_game.get_state",
     '"start_game"',
     '"submit_response"',
-    '"get_state"',
 )
 
 
@@ -90,13 +92,42 @@ class OpenClawHarness(ExternalAgentHarness):
     def run_episode(self,
                     instruction: str,
                     output_dir: Path | str | None = None) -> AgentRunResult:
+        completion_path = new_game_completion_path()
+        proxy = proxy_for_model_connection(self._model_connection, completion_path)
+
+        if proxy is not None:
+            with proxy:
+                return self._run_episode(
+                    instruction,
+                    output_dir,
+                    completion_path,
+                    proxy.base_url,
+                )
+
+        return self._run_episode(instruction, output_dir, completion_path, None)
+
+    def _run_episode(self,
+                     instruction: str,
+                     output_dir: Path | str | None,
+                     completion_path: Path,
+                     proxied_base_url: str | None) -> AgentRunResult:
         artifacts: dict[str, Path | str | int | float | bool | None] = {}
         metadata: dict[str, Any] = {
             "adapter": "openclaw",
             "reasoning_effort": self.reasoning_effort,
+            "resolved_backend": (self._model_connection or {}).get("backend"),
+            "gateway_base_url": (self._model_connection or {}).get("base_url"),
+            "compatibility_proxy_base_url": proxied_base_url,
+            "tool_choice": (self._model_connection or {}).get("tool_choice"),
+            "request_body_overrides": (
+                (self._model_connection or {}).get("request_body_overrides") or {}
+            ),
+            "verify_tls": (self._model_connection or {}).get("verify_tls"),
             "success": False,
             "returncode": None,
             "runtime_error": None,
+            "game_completed": False,
+            "terminated_after_game": False,
         }
 
         try:
@@ -104,6 +135,10 @@ class OpenClawHarness(ExternalAgentHarness):
                 model_connection=self._model_connection,
                 model=self.model,
                 harness_name="OpenClawHarness",
+            )
+            runtime_model = (
+                (self._model_connection or {}).get("runtime_model")
+                or runtime_model
             )
         except Exception as error:
             metadata["runtime_error"] = str(error)
@@ -133,13 +168,14 @@ class OpenClawHarness(ExternalAgentHarness):
         base_command = ["openclaw", "--no-color", "--profile", self.profile]
 
         bridge_environment = mcp_environment(self.mcp_url)
+        bridge_environment["CLEM_GAME_COMPLETION_PATH"] = str(completion_path)
         mcp_command = base_command + [
             "mcp", "add", "clem_game",
             "--command", "python",
             "--arg", "-m",
             "--arg", "clemcore.agents.mcp.bridge",
             "--cwd", "/opt/clemcore",
-            "--include", "start_game,submit_response,get_state",
+            "--include", "start_game,submit_response",
             "--no-probe",
         ]
         for name, value in sorted(bridge_environment.items()):
@@ -147,6 +183,18 @@ class OpenClawHarness(ExternalAgentHarness):
 
         config = (self._model_connection or {}).get("openclaw_config_patch", {})
         config = dict(config) if isinstance(config, dict) else {}
+
+        if proxied_base_url is not None:
+            provider_name = (self._model_connection or {}).get("openclaw_provider")
+
+            if provider_name:
+                config = deep_merge_dicts(config, {
+                    "models": {
+                        "providers": {
+                            str(provider_name): {"baseUrl": proxied_base_url},
+                        },
+                    },
+                })
         # Keep OpenClaw's default tool inventory available in YOLO mode so that
         # models can use standard tools in addition to the Clem MCP tools.
         config = deep_merge_dicts(config, {
@@ -185,21 +233,37 @@ class OpenClawHarness(ExternalAgentHarness):
             ("agent", agent_command, None, self.timeout + 30),
         )
         results: dict[str, subprocess.CompletedProcess[str]] = {}
+        terminated_after_game = False
 
         try:
             with temporary_environment(runtime_environment):
                 for name, command, input_text, command_timeout in commands:
-                    result = subprocess.run(
-                        command,
-                        input=input_text,
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=command_timeout,
-                        check=False,
-                    )
+                    if name == "agent":
+                        result, terminated_after_game = run_process_until_game_complete(
+                            command,
+                            completion_path=completion_path,
+                            timeout=command_timeout,
+                        )
+                    else:
+                        result = subprocess.run(
+                            command,
+                            input=input_text,
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            timeout=command_timeout,
+                            check=False,
+                        )
                     results[name] = result
-                    if result.returncode != 0:
+                    completion = read_game_completion(completion_path)
+                    game_completed = bool(
+                        completion
+                        and completion.get("done") is True
+                        and completion.get("control_failure") is not True
+                    )
+                    if result.returncode != 0 and not (
+                        name == "agent" and (terminated_after_game or game_completed)
+                    ):
                         detail = _error_detail(result)
                         metadata["runtime_error"] = f"OpenClaw {name} failed"
                         if detail:
@@ -213,6 +277,7 @@ class OpenClawHarness(ExternalAgentHarness):
         agent_result = results.get("agent")
         if agent_result is not None:
             metadata["returncode"] = agent_result.returncode
+        metadata["terminated_after_game"] = terminated_after_game
 
         # The agent output plus native session JSONL is sufficient for scoring and
         # debugging. Setup-command chatter is only included when setup fails.
@@ -239,12 +304,19 @@ class OpenClawHarness(ExternalAgentHarness):
         tool_call_count = sum(
             combined_trace.count(marker) for marker in GAME_TOOL_MARKERS
         )
+        metadata["tool_call_count_hint"] = tool_call_count
+        completion = read_game_completion(completion_path)
+        metadata["game_completed"] = bool(
+            completion
+            and completion.get("done") is True
+            and completion.get("control_failure") is not True
+        )
         if metadata["runtime_error"] is None and agent_result is not None:
-            if tool_call_count:
+            if metadata["game_completed"]:
                 metadata["success"] = True
             else:
                 metadata["runtime_error"] = (
-                    "OpenClaw completed without calling a clem_game tool"
+                    "OpenClaw ended before clem_game reported done=true"
                 )
 
         trace_path = write_text_artifact(

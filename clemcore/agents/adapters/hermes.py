@@ -3,12 +3,16 @@ import subprocess
 from pathlib import Path
 
 from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
+from clemcore.agents.adapters.openai_compatible_proxy import proxy_for_model_connection
 from clemcore.agents.adapters.utils import (
     load_model_connection,
     mcp_environment,
     model_connection_environment,
+    new_game_completion_path,
+    read_game_completion,
     redact_sensitive,
     resolve_runtime_model,
+    run_process_until_game_complete,
     temporary_environment,
     write_text_artifact,
 )
@@ -58,6 +62,25 @@ class HermesHarness(ExternalAgentHarness):
     def run_episode(self,
                     instruction: str,
                     output_dir: Path | str | None = None) -> AgentRunResult:
+        completion_path = new_game_completion_path()
+        proxy = proxy_for_model_connection(self._model_connection, completion_path)
+
+        if proxy is not None:
+            with proxy:
+                return self._run_episode(
+                    instruction,
+                    output_dir,
+                    completion_path,
+                    proxy.base_url,
+                )
+
+        return self._run_episode(instruction, output_dir, completion_path, None)
+
+    def _run_episode(self,
+                     instruction: str,
+                     output_dir: Path | str | None,
+                     completion_path: Path,
+                     proxied_base_url: str | None) -> AgentRunResult:
         """Run one Hermes episode.
 
         Args:
@@ -76,6 +99,13 @@ class HermesHarness(ExternalAgentHarness):
             "clem_model": self.clem_model,
             "runtime_model": None,
             "resolved_backend": (self._model_connection or {}).get("backend"),
+            "gateway_base_url": (self._model_connection or {}).get("base_url"),
+            "compatibility_proxy_base_url": proxied_base_url,
+            "tool_choice": (self._model_connection or {}).get("tool_choice"),
+            "request_body_overrides": (
+                (self._model_connection or {}).get("request_body_overrides") or {}
+            ),
+            "verify_tls": (self._model_connection or {}).get("verify_tls"),
             "provider": self.provider,
             "mcp_url": self.mcp_url,
             "max_turns": self.max_turns,
@@ -85,6 +115,7 @@ class HermesHarness(ExternalAgentHarness):
             "returncode": None,
             "runtime_error": None,
             "game_completed": False,
+            "terminated_after_game": False,
             "tool_call_count_hint": 0,
             "hermes_session_id": None,
             "raw_reasoning_available": None,
@@ -108,9 +139,13 @@ class HermesHarness(ExternalAgentHarness):
 
         runtime_environment = model_connection_environment(self._model_connection)
 
+        if proxied_base_url is not None:
+            runtime_environment["OPENAI_BASE_URL"] = proxied_base_url
+
         # ----- step 2 -----
         # build the MCP registration, trace configuration, and chat commands
         bridge_environment = mcp_environment(self.mcp_url, include_pythonpath=True)
+        bridge_environment["CLEM_GAME_COMPLETION_PATH"] = str(completion_path)
         register_command = [
             "hermes",
             "mcp",
@@ -123,6 +158,7 @@ class HermesHarness(ExternalAgentHarness):
             f"OPENENV_MCP_URL={bridge_environment['OPENENV_MCP_URL']}",
             f"CLEM_EXPERIMENT_NAME={bridge_environment.get('CLEM_EXPERIMENT_NAME', '')}",
             f"CLEM_GAME_ID={bridge_environment.get('CLEM_GAME_ID', '')}",
+            f"CLEM_GAME_COMPLETION_PATH={completion_path}",
             f"CLEM_OPENENV_SESSION_PATH={bridge_environment.get('CLEM_OPENENV_SESSION_PATH', '')}",
             "--args",
             "-m",
@@ -140,11 +176,15 @@ class HermesHarness(ExternalAgentHarness):
                 self.reasoning_effort,
             ])
 
+        runtime_provider = (
+            (self._model_connection or {}).get("provider") or self.provider
+        )
+        metadata["provider"] = runtime_provider
         chat_command = [
             "hermes",
             "chat",
             "--provider",
-            self.provider,
+            str(runtime_provider),
             "--model",
             runtime_model,
             "--max-turns",
@@ -179,11 +219,12 @@ class HermesHarness(ExternalAgentHarness):
                 )
 
             try:
-                chat = subprocess.run(chat_command,
-                                      text=True,
-                                      stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE,
-                                      timeout=self.timeout)
+                chat, terminated_after_game = run_process_until_game_complete(
+                    chat_command,
+                    completion_path=completion_path,
+                    timeout=self.timeout,
+                )
+                metadata["terminated_after_game"] = terminated_after_game
             except subprocess.TimeoutExpired as error:
                 def timeout_output(value: str | bytes | None) -> str:
                     if isinstance(value, bytes):
@@ -257,15 +298,23 @@ class HermesHarness(ExternalAgentHarness):
             chat.stderr,
         ]))
         session_text = chat.stdout + "\n" + chat.stderr
-        metadata["game_completed"] = any(
-            marker in session_text
-            for marker in (
-                '"done":true',
-                '"done": true',
-                '\\"done\\":true',
-                '\\"done\\": true',
+        completion = read_game_completion(completion_path)
+        if completion is not None:
+            metadata["game_completed"] = bool(
+                completion
+                and completion.get("done") is True
+                and completion.get("control_failure") is not True
             )
-        )
+        else:
+            metadata["game_completed"] = any(
+                marker in session_text
+                for marker in (
+                    '"done":true',
+                    '"done": true',
+                    '\\"done\\":true',
+                    '\\"done\\": true',
+                )
+            )
         session_match = re.search(r"^Session:\s*(\S+)",
                                   session_text,
                                   flags=re.MULTILINE)
@@ -283,16 +332,14 @@ class HermesHarness(ExternalAgentHarness):
         )
         metadata["success"] = (
             register.returncode == 0
-            and chat.returncode == 0
-            and metadata["tool_call_count_hint"] > 0
             and metadata["game_completed"]
         )
 
         if register.returncode != 0:
             metadata["runtime_error"] = "hermes mcp add failed"
-        elif chat.returncode != 0:
+        elif chat.returncode != 0 and not metadata["game_completed"]:
             metadata["runtime_error"] = "hermes chat failed"
-        elif metadata["tool_call_count_hint"] <= 0:
+        elif metadata["tool_call_count_hint"] <= 0 and not metadata["game_completed"]:
             metadata["runtime_error"] = "hermes completed without visible clem_game MCP tool calls"
         elif not metadata["game_completed"]:
             metadata["runtime_error"] = (

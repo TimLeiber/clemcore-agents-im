@@ -1,17 +1,109 @@
 import json
 import os
 import re
+import subprocess
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 
 MODEL_CONNECTION_ENV = "CLEM_AGENT_MODEL_CONNECTION_PATH"
 MCP_EPISODE_ENV = (
     "CLEM_EXPERIMENT_NAME",
     "CLEM_GAME_ID",
+    "CLEM_GAME_COMPLETION_PATH",
     "CLEM_OPENENV_SESSION_PATH",
 )
+
+
+def new_game_completion_path() -> Path:
+    """Return a unique, initially absent bridge-to-harness completion marker."""
+    path = Path("/tmp") / f"clem-game-completed-{os.getpid()}-{time.time_ns()}.json"
+    path.unlink(missing_ok=True)
+    return path
+
+
+def read_game_completion(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    return value if isinstance(value, dict) else None
+
+
+def run_process_until_game_complete(
+    command: Sequence[str],
+    *,
+    completion_path: Path,
+    input_text: str | None = None,
+    cwd: str | Path | None = None,
+    timeout: float | None = 600,
+    completion_grace: float = 1.0,
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    """Run a CLI and terminate it shortly after the bridge reports done=true."""
+    process = subprocess.Popen(
+        list(command),
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+    )
+    started_at = time.monotonic()
+    completion_seen_at: float | None = None
+    first_communicate = True
+    last_timeout: subprocess.TimeoutExpired | None = None
+
+    while True:
+        try:
+            stdout, stderr = process.communicate(
+                input=input_text if first_communicate else None,
+                timeout=0.1,
+            )
+            break
+        except subprocess.TimeoutExpired as error:
+            first_communicate = False
+            last_timeout = error
+            now = time.monotonic()
+
+            if completion_path.exists():
+                completion_seen_at = completion_seen_at or now
+
+                if now - completion_seen_at >= completion_grace:
+                    process.terminate()
+
+                    try:
+                        stdout, stderr = process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+
+                    return (
+                        subprocess.CompletedProcess(
+                            list(command), process.returncode, stdout, stderr
+                        ),
+                        True,
+                    )
+
+            if timeout is not None and now - started_at >= timeout:
+                process.kill()
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(
+                    list(command),
+                    timeout,
+                    output=stdout or (last_timeout.output if last_timeout else None),
+                    stderr=stderr or (last_timeout.stderr if last_timeout else None),
+                )
+
+    return (
+        subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr),
+        False,
+    )
 
 
 def load_model_connection(harness: str,
