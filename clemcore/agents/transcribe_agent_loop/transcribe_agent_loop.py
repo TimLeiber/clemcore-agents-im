@@ -408,7 +408,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Create readable HTML transcripts from agent_loop.json files"
     )
-    parser.add_argument("--results_dir",
+    parser.add_argument("-r",
+                        "--results_dir",
                         "--results-dir",
                         default="results/external-agents",
                         dest="results_dir",
