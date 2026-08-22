@@ -10,6 +10,7 @@ from clemcore.agents.adapters.utils import (
     load_model_connection,
     model_connection_environment,
     new_game_completion_path,
+    parse_claude_code_agent_trace,
     read_game_completion,
     resolve_runtime_model,
     temporary_environment,
@@ -38,7 +39,8 @@ class ClaudeCodeHarness(ExternalAgentHarness):
                  permission_mode: str = "bypassPermissions",
                  timeout: int = 600,
                  reasoning_effort: str | None = None,
-                 model_connection_path: str | None = None):
+                 model_connection_path: str | None = None,
+                 trace_model_io: bool = True):
         """Configure the Claude Code harness.
 
         Args:
@@ -52,6 +54,7 @@ class ClaudeCodeHarness(ExternalAgentHarness):
             timeout: maximum duration of one Claude Code episode in seconds
             reasoning_effort: model reasoning effort passed to Claude Code
             model_connection_path: optional resolved model-connection file
+            trace_model_io: whether to record model requests and responses
         """
 
         self.model = model or clem_model
@@ -63,7 +66,16 @@ class ClaudeCodeHarness(ExternalAgentHarness):
         self.permission_mode = permission_mode
         self.timeout = timeout
         self.reasoning_effort = reasoning_effort
+        self.trace_model_io = trace_model_io
         self._model_connection = load_model_connection("claude_code", model_connection_path)
+
+    @classmethod
+    def parse_agent_trace(cls,
+                          episode_dir: Path,
+                          metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Delegate Claude Code trace parsing to adapter utilities."""
+
+        return parse_claude_code_agent_trace(episode_dir=episode_dir, metadata=metadata)
 
     async def run_episode_async(self,
                                 instruction: str,
@@ -97,6 +109,8 @@ class ClaudeCodeHarness(ExternalAgentHarness):
             "allowed_tools": self.allowed_tools,
             "max_turns": self.max_turns,
             "permission_mode": self.permission_mode,
+            "include_partial_messages": self.trace_model_io,
+            "include_hook_events": self.trace_model_io,
         }
 
         if runtime_model:
@@ -139,7 +153,11 @@ class ClaudeCodeHarness(ExternalAgentHarness):
                     instruction: str,
                     output_dir: Path | str | None = None) -> AgentRunResult:
         completion_path = new_game_completion_path()
-        proxy = proxy_for_model_connection(self._model_connection, completion_path)
+        proxy = proxy_for_model_connection(self._model_connection,
+                                           completion_path,
+                                           include_openrouter=True,
+                                           trace_responses=self.trace_model_io,
+                                           trace_requests=self.trace_model_io)
 
         if proxy is not None:
             with proxy:
@@ -233,6 +251,7 @@ class ClaudeCodeHarness(ExternalAgentHarness):
             "verify_tls": (self._model_connection or {}).get("verify_tls"),
             "timeout": self.timeout,
             "reasoning_effort": self.reasoning_effort,
+            "trace_model_io": self.trace_model_io,
             "success": game_completed,
             "session_id": None,
             "duration_ms": None,

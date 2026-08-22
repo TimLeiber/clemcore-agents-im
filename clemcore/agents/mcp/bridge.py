@@ -1,4 +1,3 @@
-import atexit
 import json
 import os
 import sys
@@ -140,10 +139,16 @@ class OpenEnvMCPClient:
 
         session_id = self.create_session()
 
+        arguments = arguments or {}
+
+        if name == "submit_response" and arguments.get("response") == CONTROL_FAILURE_RESPONSE:
+            name = "abort_game"
+            arguments = {"reason": CONTROL_FAILURE_RESPONSE}
+
         result = self._request("tools/call",
                                {"session_id": session_id,
                                 "name": name,
-                                "arguments": arguments or {}})
+                                "arguments": arguments})
 
         return result["data"]
 
@@ -183,31 +188,6 @@ def create_mcp_bridge(openenv_mcp_url: str | None = None) -> FastMCP:
     game_state = {"started": False,
                   "done": False,
                   "result": None}
-
-    def cleanup_openenv_session() -> None:
-        """Report an unfinished game to the host and close the session"""
-        if client.session_id is None:
-            return
-
-        if game_state["started"] and not game_state["done"]:
-            try:
-                result = client.call_tool("submit_response",
-                                          {"response": CONTROL_FAILURE_RESPONSE})
-                game_state["result"] = result
-
-                if result.get("done") is True:
-                    game_state["done"] = True
-                    _write_completion_marker(result, control_failure=True)
-
-            except Exception as error:
-                print(f"failed to submit control failure response: {error}", file=sys.stderr)
-
-        try:
-            client.close_session()
-        except Exception as error:
-            print(f"failed to close OpenEnv session: {error}", file=sys.stderr)
-
-    atexit.register(cleanup_openenv_session)
 
     @mcp.tool()
     def start_game() -> dict[str, Any]:
@@ -258,12 +238,30 @@ def create_mcp_bridge(openenv_mcp_url: str | None = None) -> FastMCP:
             arguments["experiment_name"] = experiment_name
 
         result = client.call_tool("start_game", arguments)
+
+        started_path = os.environ.get("CLEM_GAME_STARTED_PATH")
+
+        if started_path:
+            path = Path(started_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({
+                    "session_id": client.session_id,
+                    "experiment_name": experiment_name,
+                    "game_id": int(game_id) if game_id is not None else None
+                }),
+                encoding="utf-8"
+            )
+
         game_state["started"] = True
         game_state["result"] = result
         game_state["done"] = result.get("done") is True
 
         if game_state["done"]:
-            _write_completion_marker(result)
+            try:
+                client.close_session()
+            finally:
+                _write_completion_marker(result)
 
         return result
 

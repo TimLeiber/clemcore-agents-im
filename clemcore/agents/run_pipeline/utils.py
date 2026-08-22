@@ -1,4 +1,5 @@
 import json
+import shutil
 import socket
 import subprocess
 import time
@@ -222,6 +223,9 @@ def run_docker_episode(experiment_name: str,
     if shared_state_dir is not None:
         command.extend([
             "-e", "CLEM_OPENENV_SESSION_PATH=/run/clem-agent/openenv_session.json",
+            "-e", "CLEM_GAME_STARTED_PATH=/run/clem-agent/game_started.json",
+            "-e", "CLEM_AGENT_ARTIFACT_ROOT=/run/clem-agent/agent_artifacts",
+            "-e", "CLEM_AGENT_LOOP_PATH=/run/clem-agent/agent_loop.json",
             "-v", f"{shared_state_dir}:/run/clem-agent:rw",
         ])
 
@@ -280,6 +284,7 @@ def run_docker_episode(experiment_name: str,
         # recover an unfinished openenv session
         if shared_state_dir is not None:
             session_path = shared_state_dir / "openenv_session.json"
+            game_started_path = shared_state_dir / "game_started.json"
 
             if session_path.exists():
                 try:
@@ -316,18 +321,42 @@ def run_docker_episode(experiment_name: str,
                 except Exception as error:
                     trace_lines.append(f"openenv_session_cleanup_failed: path={session_path} error={error}\n")
 
+            elif not game_started_path.exists():
+                client = OpenEnvMCPClient(HOST_OPENENV_MCP_URL)
+
+                try:
+                    session_id = client.create_session()
+                    client.call_tool("start_game", {
+                        "experiment_name": experiment_name,
+                        "game_id": int(game_id)
+                    })
+                    result = client.call_tool("submit_response", {"response": CONTROL_FAILURE_RESPONSE})
+                    trace_lines.append(f"openenv_control_failure_submitted: "
+                                       f"session_id={session_id} done={result.get('done')}\n")
+                except Exception as error:
+                    trace_lines.append(f"openenv_control_failure_failed: error={error}\n")
+                finally:
+                    if client.session_id is not None:
+                        try:
+                            session_id = client.session_id
+                            client.close_session()
+                            trace_lines.append(f"openenv_session_closed: {session_id}\n")
+                        except Exception as error:
+                            trace_lines.append(f"openenv_session_close_failed: error={error}\n")
+
     return "".join(trace_lines), return_code
 
 
-def write_agent_trace(results_dir: str,
-                      run_dir: str,
-                      game_name: str,
-                      experiment_name: str,
-                      game_id: int | str,
-                      before_episode_dirs: set[Path],
-                      trace_text: str,
-                      metadata: dict) -> Path:
-    """Write the agent trace into the corresponding clembench episode directory.
+def write_agent_artifacts(results_dir: str,
+                          run_dir: str,
+                          game_name: str,
+                          experiment_name: str,
+                          game_id: int | str,
+                          before_instance_dirs: set[Path],
+                          trace_text: str,
+                          metadata: dict,
+                          standardized_trace_path: Path | None = None) -> Path:
+    """Write agent artifacts into the corresponding clembench instance directory.
 
     Args:
         results_dir: Root directory containing the clembench results.
@@ -335,18 +364,19 @@ def write_agent_trace(results_dir: str,
         game_name: Name of the game that was run.
         experiment_name: Name of the experiment containing the episode.
         game_id: Identifier of the game instance that was run.
-        before_episode_dirs: Episode directories that existed before the run.
-        trace_text: Raw output captured from the agent container.
+        before_instance_dirs: Instance directories that existed before the run.
+        trace_text: Raw output captured from the agent container
         metadata: Additional information to store alongside the trace.
+        standardized_trace_path: Existing JSON created by the harness adapter
 
     Returns:
         Path to the written agent trace file.
     """
 
-    # find all episode directories that exist after the run
+    # find all instance directories that exist after the run
     results_path = Path(results_dir)
-    after_episode_dirs = {path for path in results_path.glob(f"{run_dir}/{game_name}/{experiment_name}/episode_*")
-                          if path.is_dir()}
+    after_instance_dirs = {path for path in results_path.glob(f"{run_dir}/{game_name}/{experiment_name}/instance_*")
+                           if path.is_dir()}
 
     try:
         run_started_timestamp = datetime.fromisoformat(
@@ -357,33 +387,31 @@ def write_agent_trace(results_dir: str,
         # tree over risking an overwrite of an unrelated historical episode.
         run_started_timestamp = datetime.now(timezone.utc).timestamp()
 
-    # record the modification time of every episode directory
-    episode_timestamps = {}
+    # record the modification time of every instance directory
+    instance_timestamps = {}
 
-    for episode_dir in after_episode_dirs:
+    for instance_dir in after_instance_dirs:
         timestamp_candidates = [
-            episode_dir / "interactions.json",
-            episode_dir / "instance.json",
-            episode_dir,
+            instance_dir / "interactions.json",
+            instance_dir / "instance.json",
+            instance_dir,
         ]
 
-        episode_timestamps[episode_dir] = max(path.stat().st_mtime for path in timestamp_candidates if path.exists())
+        instance_timestamps[instance_dir] = max(path.stat().st_mtime for path in timestamp_candidates if path.exists())
 
-    # first try to identify an episode directory created by this run
-    new_episode_dirs = after_episode_dirs - before_episode_dirs
+    # first try to identify an instance directory created by this run
+    new_instance_dirs = after_instance_dirs - before_instance_dirs
 
-    if new_episode_dirs:
-        output_dir = max(new_episode_dirs, key=episode_timestamps.get)
+    if new_instance_dirs:
+        output_dir = max(new_instance_dirs, key=instance_timestamps.get)
 
     else:
-        # Only reuse an existing episode directory if this run actually
-        # modified it. A failed agent may create no episode at all; selecting
-        # an old directory by game_id alone can overwrite another agent's
-        # trace because all result trees reuse the same episode numbers.
-        matching_episode_dirs = []
+        # Only reuse an existing instance directory if this run actually
+        # modified it. A failed agent may create no instance at all.
+        matching_instance_dirs = []
 
-        for episode_dir in after_episode_dirs:
-            instance_path = episode_dir / "instance.json"
+        for instance_dir in after_instance_dirs:
+            instance_path = instance_dir / "instance.json"
 
             if not instance_path.exists():
                 continue
@@ -396,11 +424,11 @@ def write_agent_trace(results_dir: str,
                 continue
 
             if (int(instance.get("game_id")) == int(game_id)
-                    and episode_timestamps[episode_dir] >= run_started_timestamp):
-                matching_episode_dirs.append(episode_dir)
+                    and instance_timestamps[instance_dir] >= run_started_timestamp):
+                matching_instance_dirs.append(instance_dir)
 
-        if matching_episode_dirs:
-            output_dir = max(matching_episode_dirs, key=episode_timestamps.get)
+        if matching_instance_dirs:
+            output_dir = max(matching_instance_dirs, key=instance_timestamps.get)
 
         else:
             # preserve the trace separately when clembench created no episode
@@ -424,6 +452,9 @@ def write_agent_trace(results_dir: str,
         json.dumps(metadata, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+    if standardized_trace_path is not None:
+        shutil.copy2(standardized_trace_path, output_dir / "agent_loop.json")
 
     return trace_path
 

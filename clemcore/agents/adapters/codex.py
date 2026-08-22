@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
 from clemcore.agents.adapters.openai_compatible_proxy import proxy_for_model_connection
@@ -10,6 +11,7 @@ from clemcore.agents.adapters.utils import (
     mcp_environment,
     model_connection_environment,
     new_game_completion_path,
+    parse_codex_agent_trace,
     read_game_completion,
     resolve_runtime_model,
     run_process_until_game_complete,
@@ -31,7 +33,8 @@ class CodexHarness(ExternalAgentHarness):
                  mcp_url: str = "http://host.docker.internal:8001/mcp",
                  sandbox: str = "full_access",
                  reasoning_effort: str | None = None,
-                 model_connection_path: str | None = None):
+                 model_connection_path: str | None = None,
+                 trace_model_io: bool = True):
         """Configure the Codex harness.
 
         Args:
@@ -41,6 +44,7 @@ class CodexHarness(ExternalAgentHarness):
             sandbox: Codex sandbox policy
             reasoning_effort: model reasoning effort passed to Codex
             model_connection_path: optional resolved model-connection file
+            trace_model_io: whether to record model requests and responses
         """
 
         self.model = model or clem_model or "gpt-5.4"
@@ -48,7 +52,16 @@ class CodexHarness(ExternalAgentHarness):
         self.mcp_url = mcp_url
         self.sandbox = sandbox
         self.reasoning_effort = reasoning_effort
+        self.trace_model_io = trace_model_io
         self._model_connection = load_model_connection("codex", model_connection_path)
+
+    @classmethod
+    def parse_agent_trace(cls,
+                          episode_dir: Path,
+                          metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Delegate Codex-specific trace parsing to adapter utilities."""
+
+        return parse_codex_agent_trace(episode_dir=episode_dir, metadata=metadata)
 
     def run_episode(self,
                     instruction: str,
@@ -58,7 +71,8 @@ class CodexHarness(ExternalAgentHarness):
         proxy = proxy_for_model_connection(self._model_connection,
                                            completion_path,
                                            include_openrouter=True,
-                                           trace_responses=resolved_backend != "openrouter")
+                                           trace_responses=self.trace_model_io,
+                                           trace_requests=self.trace_model_io)
 
         if proxy is not None:
             with proxy:
@@ -115,7 +129,12 @@ class CodexHarness(ExternalAgentHarness):
                 f"Expected one of: {sorted(sandbox_modes)}"
             )
 
-        # ----- step 2 -----
+        # ----- step 2:
+        # define configuration for Codex CLI, e.g. tool access, permissions, model provider, model reasoning effort etc.
+        # by creating temporary dedicated config file. This file is called ~/.codex/config.toml for codex.
+        # Alternatively one could pass all configurations as parameters to the harness during use
+        # -----
+
         # write the Codex configuration that registers the MCP bridge
         config_dir = Path.home() / ".codex"
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -125,9 +144,14 @@ class CodexHarness(ExternalAgentHarness):
         environment_lines = "\n".join(
             f"{key} = {json.dumps(value)}" for key, value in sorted(bridge_environment.items())
         )
+
+        # set approvals in ~/.codex/config.toml to allow all tool use and no requirement for permissions
+        # (effectively is YOLO, but explicit)
         config_lines = [
+            f"model = {json.dumps(codex_model)}",
             'approval_policy = "never"',
-            'sandbox_mode = "danger-full-access"',
+            f"sandbox_mode = {json.dumps(sandbox_modes[self.sandbox])}",
+            'web_search = "live"',
         ]
 
         if self.reasoning_effort is not None:
@@ -191,28 +215,8 @@ class CodexHarness(ExternalAgentHarness):
         if last_message_path.exists():
             last_message_path.unlink()
 
-        command = [
-            "codex",
-            "--search",
-            "exec",
-            "--strict-config",
-            "--json",
-            "--model",
-            codex_model,
-            "--cd",
-            "/workspace",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--output-last-message",
-            str(last_message_path),
-        ]
-
-        if self.sandbox == "full_access":
-            command.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            command.extend(["--sandbox", sandbox_modes[self.sandbox]])
-
-        command.append("-")
+        command = ["codex", "exec", "--strict-config", "--json", "--cd", "/workspace", "--skip-git-repo-check",
+                   "--ephemeral", "--output-last-message", str(last_message_path), "-"]
 
         # ----- step 4 -----
         # verify that Codex can read the generated MCP configuration
@@ -257,6 +261,7 @@ class CodexHarness(ExternalAgentHarness):
             "codex_config": str(config_path),
             "sandbox": self.sandbox,
             "reasoning_effort": self.reasoning_effort,
+            "trace_model_io": self.trace_model_io,
             "success": False,
             "runtime_error": None,
             "returncode": None,
@@ -274,6 +279,8 @@ class CodexHarness(ExternalAgentHarness):
             f"gateway_base_url: {metadata['gateway_base_url']}",
             f"compatibility_proxy_base_url: {proxied_base_url}",
             f"sandbox: {self.sandbox}",
+            "trace_settings:",
+            json.dumps({"model_io": self.trace_model_io}),
             "codex_mcp_list_returncode:",
             str(mcp_list_returncode),
             "codex_mcp_list_stdout:",

@@ -1,6 +1,8 @@
+import json
 import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from clemcore.agents.adapters.base import AgentRunResult, ExternalAgentHarness
 from clemcore.agents.adapters.openai_compatible_proxy import proxy_for_model_connection
@@ -9,6 +11,7 @@ from clemcore.agents.adapters.utils import (
     mcp_environment,
     model_connection_environment,
     new_game_completion_path,
+    parse_hermes_agent_trace,
     read_game_completion,
     redact_sensitive,
     resolve_runtime_model,
@@ -34,7 +37,8 @@ class HermesHarness(ExternalAgentHarness):
                  yolo: bool = True,
                  timeout: int = 600,
                  reasoning_effort: str | None = None,
-                 model_connection_path: str | None = None):
+                 model_connection_path: str | None = None,
+                 trace_model_io: bool = True):
         """Configure the Hermes harness.
 
         Args:
@@ -47,6 +51,7 @@ class HermesHarness(ExternalAgentHarness):
             timeout: maximum duration of one Hermes chat in seconds
             reasoning_effort: model reasoning effort configured in Hermes
             model_connection_path: optional resolved model-connection file
+            trace_model_io: whether to record model requests and responses
         """
 
         self.model = model or clem_model
@@ -57,22 +62,46 @@ class HermesHarness(ExternalAgentHarness):
         self.yolo = yolo
         self.timeout = timeout
         self.reasoning_effort = reasoning_effort
+        self.trace_model_io = trace_model_io
         self._model_connection = load_model_connection("hermes", model_connection_path)
+
+    @classmethod
+    def parse_agent_trace(cls,
+                          episode_dir: Path,
+                          metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Delegate Hermes-specific trace parsing to adapter utilities."""
+
+        return parse_hermes_agent_trace(episode_dir=episode_dir, metadata=metadata)
 
     def run_episode(self,
                     instruction: str,
                     output_dir: Path | str | None = None) -> AgentRunResult:
         completion_path = new_game_completion_path()
-        proxy = proxy_for_model_connection(self._model_connection, completion_path)
+        proxy = proxy_for_model_connection(self._model_connection,
+                                           completion_path,
+                                           include_openrouter=True,
+                                           trace_responses=self.trace_model_io,
+                                           trace_requests=self.trace_model_io)
 
         if proxy is not None:
             with proxy:
-                return self._run_episode(
+                result = self._run_episode(
                     instruction,
                     output_dir,
                     completion_path,
                     proxy.base_url,
                 )
+                proxy_trace = redact_sensitive(proxy.captured_trace())
+                adapter_messages = result.artifacts.get("adapter_messages")
+
+                if proxy_trace and adapter_messages is not None:
+                    trace_path = Path(adapter_messages)
+                    trace_path.write_text(
+                        trace_path.read_text(encoding="utf-8") + "\n" + proxy_trace,
+                        encoding="utf-8"
+                    )
+
+                return result
 
         return self._run_episode(instruction, output_dir, completion_path, None)
 
@@ -111,6 +140,7 @@ class HermesHarness(ExternalAgentHarness):
             "max_turns": self.max_turns,
             "timeout": self.timeout,
             "reasoning_effort": self.reasoning_effort,
+            "trace_model_io": self.trace_model_io,
             "success": False,
             "returncode": None,
             "runtime_error": None,
@@ -140,7 +170,7 @@ class HermesHarness(ExternalAgentHarness):
         runtime_environment = model_connection_environment(self._model_connection)
 
         if proxied_base_url is not None:
-            runtime_environment["OPENAI_BASE_URL"] = proxied_base_url
+            runtime_environment["OPENROUTER_BASE_URL"] = proxied_base_url
 
         # ----- step 2 -----
         # build the MCP registration, trace configuration, and chat commands
@@ -159,13 +189,14 @@ class HermesHarness(ExternalAgentHarness):
             f"CLEM_EXPERIMENT_NAME={bridge_environment.get('CLEM_EXPERIMENT_NAME', '')}",
             f"CLEM_GAME_ID={bridge_environment.get('CLEM_GAME_ID', '')}",
             f"CLEM_GAME_COMPLETION_PATH={completion_path}",
+            f"CLEM_GAME_STARTED_PATH={bridge_environment.get('CLEM_GAME_STARTED_PATH', '')}",
             f"CLEM_OPENENV_SESSION_PATH={bridge_environment.get('CLEM_OPENENV_SESSION_PATH', '')}",
             "--args",
             "-m",
             "clemcore.agents.mcp.bridge",
         ]
         config_commands = [
-            ["hermes", "config", "set", "display.show_reasoning", "true"],
+            ["hermes", "config", "set", "display.show_reasoning", str(self.trace_model_io).lower()],
             ["hermes", "config", "set", "display.streaming", "true"],
             ["hermes", "config", "set", "display.tool_progress", "verbose"],
         ]
@@ -234,6 +265,8 @@ class HermesHarness(ExternalAgentHarness):
                 partial_stdout = timeout_output(error.stdout)
                 partial_stderr = timeout_output(error.stderr)
                 combined_trace = redact_sensitive("\n".join([
+                    "trace_settings:",
+                    json.dumps({"model_io": self.trace_model_io}),
                     "hermes_mcp_add_command:",
                     " ".join(register_command),
                     "hermes_mcp_add_stdout:",
@@ -278,6 +311,8 @@ class HermesHarness(ExternalAgentHarness):
         # ----- step 4 -----
         # combine the trace and derive the run outcome
         combined_trace = redact_sensitive("\n".join([
+            "trace_settings:",
+            json.dumps({"model_io": self.trace_model_io}),
             "hermes_mcp_add_command:",
             " ".join(register_command),
             "hermes_mcp_add_stdout:",
@@ -321,6 +356,9 @@ class HermesHarness(ExternalAgentHarness):
 
         if session_match is None:
             session_match = re.search(r"hermes --resume\s+(\S+)", session_text)
+
+        if session_match is None:
+            session_match = re.search(r"\bsession=([A-Za-z0-9_.:-]+)", session_text)
 
         if session_match is not None:
             metadata["hermes_session_id"] = session_match.group(1)

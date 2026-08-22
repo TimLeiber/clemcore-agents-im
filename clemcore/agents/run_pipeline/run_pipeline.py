@@ -18,7 +18,7 @@ from .utils import (
     load_game_instances, # load and filter game instances
     run_docker_episode, # run one agent episode in Docker
     start_server, # start the MCP server
-    write_agent_trace # store the captured agent trace
+    write_agent_artifacts # store the captured agent artifacts
 )
 
 
@@ -74,7 +74,6 @@ def main() -> None:
 
     # parse the command line arguments
     args = parser.parse_args()
-
     # map native models to non-agent player slots
     env_agents = _env_agents_from_models(
         models=args.models,
@@ -155,18 +154,21 @@ def main() -> None:
             target = game_instance.get("target_word") or game_instance.get("target")
 
             # record the episode directories that exist before this run
-            before_episode_dirs = {path
-                                   for path in Path(args.results_dir).glob(
-                                       f"{result_run_dir}/{args.game}/{experiment_name}/episode_*"
-                                   )
-                                   if path.is_dir()}
+            before_instance_dirs = {path
+                                    for path in Path(args.results_dir).glob(
+                                        f"{result_run_dir}/{args.game}/{experiment_name}/instance_*"
+                                    )
+                                    if path.is_dir()}
 
             # record start time and remove session file from previous episode
             started_at = datetime.now(timezone.utc)
             openenv_session_path = Path(temp_dir.name) / "openenv_session.json"
+            game_started_path = Path(temp_dir.name) / "game_started.json"
+            agent_loop_path = Path(temp_dir.name) / "agent_loop.json"
 
-            if openenv_session_path.exists():
-                openenv_session_path.unlink()
+            openenv_session_path.unlink(missing_ok=True)
+            game_started_path.unlink(missing_ok=True)
+            agent_loop_path.unlink(missing_ok=True)
 
             # ----- main step 3 -----
             # run the external agent inside Docker
@@ -178,17 +180,17 @@ def main() -> None:
                 shared_state_dir=Path(temp_dir.name),
             )
             finished_at = datetime.now(timezone.utc)
-
             # ----- main step 4 -----
-            # write the captured trace and metadata
-            write_agent_trace(
+            # write the captured trace, metadata, and standardized agent loop
+            write_agent_artifacts(
                 results_dir=args.results_dir,
                 run_dir=result_run_dir,
                 game_name=args.game,
                 experiment_name=experiment_name,
                 game_id=game_id,
-                before_episode_dirs=before_episode_dirs,
+                before_instance_dirs=before_instance_dirs,
                 trace_text=trace_text,
+                standardized_trace_path=agent_loop_path if agent_loop_path.exists() else None,
                 metadata={
                     "agent": args.agent,
                     "agent_player": args.agent_player,
@@ -205,7 +207,8 @@ def main() -> None:
                 },
             )
 
-
+    # always terminate/kill the running server
+    # (if this fails the server is blocked and will not allow to be called for another game to be played)
     finally:
 
         # stop the MCP server

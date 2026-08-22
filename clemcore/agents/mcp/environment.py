@@ -206,11 +206,19 @@ class SelectableClemGameEnvironment:
         options = kwargs if kwargs else None
         observation, info = self._game_env.reset(seed=seed, options=options)
 
+        if self._game_env.env.agent_selection is None:
+            done = True
+            truncated = False
+        else:
+            _, _, done, truncated, _ = self._game_env.env.last()
+
         self._state.step_count = 0
         self._state.episode_count += 1
         self._state.episode_id = f"episode_{self._state.episode_count}"
 
-        return ClemGameObservation(context=observation)
+        return ClemGameObservation(context=observation,
+                                   done=done,
+                                   metadata={**info, "truncated": truncated})
 
     def step(self,
              action: ClemGameAction,
@@ -235,6 +243,32 @@ class SelectableClemGameEnvironment:
                                    reward=float(reward),
                                    done=done,
                                    metadata={**info, **dict(truncated=truncated)})
+
+    def abort(self, reason: str) -> ClemGameObservation:
+        """Abort the active episode through the normal game finalization path.
+
+        Args:
+            reason: Synthetic response recorded as the cause of the abort
+
+        Returns:
+            The terminal observation produced by the wrapped game environment
+        """
+        if self._game_env is None:
+            raise RuntimeError("Environment has not been reset. Call start_game first.")
+
+        game_master = self._game_env.env.game_master
+        game_master.state.abort()
+        observation, reward, done, truncated, info = self._game_env.step(reason)
+
+        if not done:
+            raise RuntimeError("Control abort did not terminate the game episode.")
+
+        return ClemGameObservation(context=observation,
+                                   reward=float(reward),
+                                   done=done,
+                                   metadata={**info,
+                                             **dict(truncated=truncated,
+                                                    control_failure=True)})
 
     @property
     def state(self) -> ClemGameState:
@@ -291,6 +325,11 @@ class ClemGameMCPEnvironment(MCPEnvironment):
         def get_state() -> dict:
             """get the current clembench game state."""
             return self.clem_env.state.model_dump()
+
+        @self.tool()
+        def abort_game(reason: str) -> dict:
+            """abort the active game after an external-agent control failure."""
+            return _observation_to_dict(self.clem_env.abort(reason))
 
     def reset(self, seed=None, episode_id=None, **kwargs) -> ClemGameObservation:
         return self.clem_env.reset(seed=seed, episode_id=episode_id, **kwargs)

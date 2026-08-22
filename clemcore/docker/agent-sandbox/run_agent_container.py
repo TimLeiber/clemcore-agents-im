@@ -23,6 +23,7 @@ CONFIG_PATH = (Path(adapters.__file__).resolve().parent / "external_agent_config
 def run_external_agent_episode(agent_name: str,
                                registry_path: str | Path,
                                output_root: str | Path | None,
+                               agent_loop_output_path: str | Path | None = None,
                                instruction: str | None = None,
                                run_metadata: dict[str, Any] | None = None) -> AgentRunResult:
     """Run one episode with an external agent.
@@ -31,6 +32,7 @@ def run_external_agent_episode(agent_name: str,
         agent_name: name of the agent in the agent registry
         registry_path: path to the external-agent registry
         output_root: directory for run artifacts or None to disable output
+        agent_loop_output_path: shared path for the standardized trace
         instruction: instruction passed to the agent; loads the shared
             meta prompt when omitted
         run_metadata: optional metadata included in the run summary
@@ -94,10 +96,58 @@ def run_external_agent_episode(agent_name: str,
 
     # load the actual agent and store it in this variable
     agent = BACKENDS[backend_name](**spec.get("agent_config", {}))
+    print("agent_loop_instruction_start")
+    print(instruction)
+    print("agent_loop_instruction_end")
     result = agent.run_episode(instruction=instruction, output_dir=output_dir)
 
-    # write a machine-readable summary alongside the agent artifacts
+    # serialize the harness-specific trace before the generic pipeline sees it
     if output_dir is not None:
+        trace_parts = [
+            "agent_loop_instruction_start",
+            instruction,
+            "agent_loop_instruction_end",
+        ]
+        adapter_messages = result.artifacts.get("adapter_messages")
+
+        if adapter_messages is not None:
+            adapter_trace_path = Path(adapter_messages)
+
+            if adapter_trace_path.exists():
+                trace_parts.append(adapter_trace_path.read_text(encoding="utf-8"))
+
+        trace_path = output_dir / "agent_trace.log"
+        trace_path.write_text("\n".join(trace_parts), encoding="utf-8")
+        result.artifacts["agent_trace"] = trace_path
+
+        try:
+            agent_loop_path = agent.serialize_standardized_agent_trace(
+                episode_dir=output_dir,
+                metadata=result.metadata,
+            )
+        except Exception as error:
+            agent_loop_path = output_dir / "agent_loop.json"
+            agent_loop = {
+                "schema_version": 1,
+                "events": [],
+                "parser_error": str(error)
+            }
+            agent_loop_path.write_text(
+                json.dumps(agent_loop, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+        result.artifacts["agent_loop"] = agent_loop_path
+
+        if agent_loop_output_path is not None:
+            shared_output_path = Path(agent_loop_output_path)
+            shared_output_path.parent.mkdir(parents=True, exist_ok=True)
+            shared_output_path.write_text(
+                agent_loop_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+        # write a machine-readable summary alongside the agent artifacts
         summary = {
             "agent_name": agent_name,
             "registry_path": str(registry_path),
@@ -122,7 +172,8 @@ if __name__ == "__main__":
     result = run_external_agent_episode(
         agent_name=os.environ["CLEM_AGENT_NAME"],
         registry_path="/tmp/agent_registry.json",
-        output_root=None,
+        output_root=os.environ.get("CLEM_AGENT_ARTIFACT_ROOT"),
+        agent_loop_output_path=os.environ.get("CLEM_AGENT_LOOP_PATH"),
     )
 
     print("success:", result.success)

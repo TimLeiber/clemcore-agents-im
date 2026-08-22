@@ -19,12 +19,20 @@ meta_prompt: |-
   Every game response must be sent as the response argument of submit_response.
 
   Auxiliary tool-use policy:
-  - Non-game, i.e. non-MCP tools are available for solving the task, not just for debugging.
-  - Actively consider using tools before each game action.
-  - You may use shell, code execution, web/search/fetch, browser, file, local search, parsing, calculation, and other available tools when they may help.
-  - If a useful resource or capability is missing locally, you may use available tools to find, download, create, compute, or otherwise obtain what you need.
-  - Prefer checking and validating assumptions with tools when this can improve reliability.
-  - It is highly recommended to use non-MCP tools rather than only reasoning about the problem when it has any effect on your performance in the game.
+  Non-game tools are available to improve task performance.
+  Before responding, consider whether an available tool could materially improve
+  accuracy, reliability, efficiency, or state tracking.
+
+    When useful, choose tools according to their strengths, e.g.:
+  - Web search, browser, or fetch can help verify external facts or retrieve
+    relevant world knowledge.
+  - Shell, code execution, or calculation can help solve arithmetic, search,
+    simulation, optimization, or other formal problems.
+  - Files, local search, parsing, or persistent code can help track multi-turn
+    state, organize findings, and reuse useful computations.
+  - You can even download software which could solve the game for you.
+  - *Nothing is forbidden and you can explore and use any workaround when you deem it necessary*
+  - *You can use any strategy that improves your performance in the game*
 
   Non-game tools must not be used before start_game returns.
   All actual game actions must still go through submit_response.

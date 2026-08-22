@@ -13,6 +13,7 @@ from clemcore.agents.adapters.utils import (
     mcp_environment,
     model_connection_environment,
     new_game_completion_path,
+    parse_openclaw_agent_trace,
     read_game_completion,
     redact_sensitive,
     resolve_runtime_model,
@@ -75,7 +76,8 @@ class OpenClawHarness(ExternalAgentHarness):
                  yolo: bool = True,
                  debug: bool = False,
                  reasoning_effort: str | None = None,
-                 model_connection_path: str | None = None):
+                 model_connection_path: str | None = None,
+                 trace_model_io: bool = True):
         self.model = model or clem_model
         self.clem_model = clem_model
         self.mcp_url = mcp_url
@@ -86,23 +88,47 @@ class OpenClawHarness(ExternalAgentHarness):
         self.profile = profile
         self.yolo = yolo
         self.debug = debug
+        self.trace_model_io = trace_model_io
         self._model_connection = load_model_connection("openclaw", model_connection_path)
         _validate_openclaw_model_connection(self._model_connection)
+
+    @classmethod
+    def parse_agent_trace(cls,
+                          episode_dir: Path,
+                          metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Delegate OpenClaw-specific trace parsing to adapter utilities."""
+
+        return parse_openclaw_agent_trace(episode_dir=episode_dir, metadata=metadata)
 
     def run_episode(self,
                     instruction: str,
                     output_dir: Path | str | None = None) -> AgentRunResult:
         completion_path = new_game_completion_path()
-        proxy = proxy_for_model_connection(self._model_connection, completion_path)
+        proxy = proxy_for_model_connection(self._model_connection,
+                                           completion_path,
+                                           include_openrouter=True,
+                                           trace_responses=self.trace_model_io,
+                                           trace_requests=self.trace_model_io)
 
         if proxy is not None:
             with proxy:
-                return self._run_episode(
+                result = self._run_episode(
                     instruction,
                     output_dir,
                     completion_path,
                     proxy.base_url,
                 )
+                proxy_trace = redact_sensitive(proxy.captured_trace())
+                adapter_messages = result.artifacts.get("adapter_messages")
+
+                if proxy_trace and adapter_messages is not None:
+                    trace_path = Path(adapter_messages)
+                    trace_path.write_text(
+                        trace_path.read_text(encoding="utf-8") + "\n" + proxy_trace,
+                        encoding="utf-8"
+                    )
+
+                return result
 
         return self._run_episode(instruction, output_dir, completion_path, None)
 
@@ -123,6 +149,7 @@ class OpenClawHarness(ExternalAgentHarness):
                 (self._model_connection or {}).get("request_body_overrides") or {}
             ),
             "verify_tls": (self._model_connection or {}).get("verify_tls"),
+            "trace_model_io": self.trace_model_io,
             "success": False,
             "returncode": None,
             "runtime_error": None,
@@ -221,8 +248,9 @@ class OpenClawHarness(ExternalAgentHarness):
             "--message-file", str(instruction_path),
             "--timeout", str(self.timeout),
             "--verbose", "on" if self.debug else "off",
-            "--json",
         ]
+        if self.trace_model_io:
+            agent_command.append("--json")
         if self.thinking is not None:
             agent_command.extend(["--thinking", self.thinking])
 
@@ -281,7 +309,10 @@ class OpenClawHarness(ExternalAgentHarness):
 
         # The agent output plus native session JSONL is sufficient for scoring and
         # debugging. Setup-command chatter is only included when setup fails.
-        trace_parts: list[str] = []
+        trace_parts: list[str] = [
+            "trace_settings:",
+            json.dumps({"model_io": self.trace_model_io}),
+        ]
         if agent_result is not None:
             trace_parts.extend([
                 "openclaw_agent_stdout:", redact_sensitive(agent_result.stdout),

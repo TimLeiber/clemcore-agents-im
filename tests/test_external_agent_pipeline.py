@@ -14,7 +14,10 @@ from unittest.mock import patch
 import requests
 
 from clemcore.agents.adapters import model_connection
-from clemcore.agents.adapters.claude_code import _anthropic_proxy_base_url
+from clemcore.agents.adapters.claude_code import (
+    ClaudeCodeHarness,
+    _anthropic_proxy_base_url,
+)
 from clemcore.agents.adapters.hermes import HermesHarness
 from clemcore.agents.adapters.openai_compatible_proxy import (
     OpenAICompatibleProxy,
@@ -30,7 +33,7 @@ from clemcore.agents.mcp.bridge import (
     create_mcp_bridge,
 )
 from clemcore.agents.mcp.server import result_run_dir_name
-from clemcore.agents.run_pipeline.utils import write_agent_trace
+from clemcore.agents.run_pipeline.utils import write_agent_artifacts
 from clemcore.agents.adapters.utils import run_process_until_game_complete
 
 
@@ -39,6 +42,379 @@ class TestExternalAgentPipeline(unittest.TestCase):
         self.assertEqual(
             _anthropic_proxy_base_url("http://127.0.0.1:1234/api/v1"),
             "http://127.0.0.1:1234/api",
+        )
+
+    def test_claude_code_trace_parser_standardizes_sdk_messages(self):
+        trace = "\n".join([
+            "agent_loop_instruction_start",
+            "Play through MCP tools.",
+            "agent_loop_instruction_end",
+            "SystemMessage(subtype='init', data={'tools': ['WebSearch', 'mcp__clem_game__start_game'], 'model': 'test-model', 'permissionMode': 'bypassPermissions'})",
+            "SystemMessage(subtype='thinking_tokens', data={'estimated_tokens': 4, 'estimated_tokens_delta': 4})",
+            "AssistantMessage(content=[ThinkingBlock(thinking='I should search.', signature='')], message_id='message-1')",
+            "AssistantMessage(content=[TextBlock(text='I will verify this.')], message_id='message-1')",
+            "AssistantMessage(content=[ToolUseBlock(id='call-1', name='WebSearch', input={'query': 'example'})], message_id='message-1')",
+            "UserMessage(content=[ToolResultBlock(tool_use_id='call-1', content='search result', is_error=None)])",
+            "AssistantMessage(content=[TextBlock(text='DONE')], message_id='message-2')",
+            "ResultMessage(subtype='success', duration_ms=20, is_error=False, num_turns=2, result='DONE')",
+            "success: True",
+        ])
+
+        with tempfile.TemporaryDirectory() as directory:
+            episode_dir = Path(directory)
+            (episode_dir / "agent_trace.log").write_text(trace, encoding="utf-8")
+            parsed = ClaudeCodeHarness.parse_agent_trace(episode_dir)
+
+        event_types = [event["type"] for event in parsed["events"]]
+        self.assertEqual(parsed["backend"], "claude_code")
+        self.assertIn("instruction", event_types)
+        self.assertIn("reasoning", event_types)
+        self.assertIn("tool_call", event_types)
+        self.assertIn("tool_result", event_types)
+        self.assertIn("tool_preamble", event_types)
+        self.assertIn("assistant_text", event_types)
+        self.assertEqual(parsed["runtime"]["model"], "test-model")
+        self.assertEqual(parsed["result"]["num_turns"], 2)
+        self.assertEqual(parsed["capture"]["thinking_tokens"]["estimated_total"], 4)
+
+    def test_hermes_trace_parser_standardizes_verbose_cli_output(self):
+        trace = "\n".join([
+            "agent_loop_instruction_start",
+            "Play through MCP tools.",
+            "agent_loop_instruction_end",
+            "hermes_chat_command:",
+            "hermes chat --provider openrouter --model test-model --yolo -q <instruction>",
+            "hermes_chat_stdout:",
+            "Query: Play through MCP tools.",
+            "Initializing agent...",
+            "🤖 AI Agent initialized with model: test-model",
+            "🛠️  Final tool selection (2 tools): web_search, mcp__clem_game__start_game",
+            "┌─ Reasoning ─────────┐",
+            "I should start the game.",
+            "└─────────────────────┘",
+            "  📞 Tool 1: mcp__clem_game__start_game([])",
+            "     Args: {}",
+            "  ┊ ⚡ preparing mcp__clem_game__start_game…",
+            "  ✅ Tool 1 completed in 0.10s",
+            "     Result: {\"structuredContent\": {\"context\": {\"role\": \"user\", \"content\": \"Game prompt\"}, \"done\": false}}",
+            "hermes_chat_stderr:",
+            "success: True",
+        ])
+
+        with tempfile.TemporaryDirectory() as directory:
+            episode_dir = Path(directory)
+            (episode_dir / "agent_trace.log").write_text(trace, encoding="utf-8")
+            parsed = HermesHarness.parse_agent_trace(episode_dir)
+
+        event_types = [event["type"] for event in parsed["events"]]
+        self.assertEqual(parsed["backend"], "hermes")
+        self.assertIn("instruction", event_types)
+        self.assertIn("reasoning", event_types)
+        self.assertIn("tool_call", event_types)
+        self.assertIn("tool_result", event_types)
+        self.assertEqual(parsed["runtime"]["model"], "test-model")
+        self.assertTrue(parsed["result"]["success"])
+        self.assertEqual(parsed["capture"]["tool_definitions"]["count"], 2)
+
+    def test_hermes_trace_parser_prefers_session_export(self):
+        trace = "\n".join([
+            "agent_loop_instruction_start",
+            "Play through MCP tools.",
+            "agent_loop_instruction_end",
+            "hermes_chat_stdout:",
+            "Query: Play through MCP tools.",
+            "Initializing agent...",
+            "hermes_chat_stderr:",
+            "success: True",
+        ])
+        session = {
+            "id": "session-1",
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Play through MCP tools."},
+                {
+                    "role": "assistant",
+                    "content": "I will verify this.",
+                    "reasoning": "I should search.",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": "{\"query\": \"example\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "tool_name": "web_search",
+                    "content": "search result"
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            episode_dir = Path(directory)
+            (episode_dir / "agent_trace.log").write_text(trace, encoding="utf-8")
+            (episode_dir / "hermes_session_export.jsonl").write_text(
+                json.dumps(session) + "\n",
+                encoding="utf-8",
+            )
+            parsed = HermesHarness.parse_agent_trace(episode_dir)
+
+        event_types = [event["type"] for event in parsed["events"]]
+        self.assertIn("reasoning", event_types)
+        self.assertIn("tool_preamble", event_types)
+        self.assertIn("tool_call", event_types)
+        self.assertIn("tool_result", event_types)
+        self.assertEqual(parsed["runtime"]["session_id"], "session-1")
+        self.assertEqual(
+            parsed["capture"]["semantic_events"]["source"],
+            "hermes_session_export",
+        )
+
+    def test_hermes_trace_parser_pairs_concurrent_tools(self):
+        trace = "\n".join([
+            "hermes_chat_stdout:",
+            "┌─ Reasoning ─────────┐",
+            "I should search twice.",
+            "└─────────────────────┘",
+            "  ⚡ Concurrent: 2 tool calls — web_search, web_search",
+            "  📞 Tool 1: web_search(['query'])",
+            "     Args: {\"query\": \"first\"}",
+            "  📞 Tool 2: web_search(['query'])",
+            "     Args: {\"query\": \"second\"}",
+            "  ┊ 🔍 search first",
+            "  ✅ Tool 1 completed in 0.10s",
+            "     Result: {\"output\": \"first result\"}",
+            "  ┊ 🔍 search second",
+            "  ✅ Tool 2 completed in 0.20s",
+            "     Result: {\"output\": \"second result\"}",
+            "hermes_chat_stderr:",
+            "success: True",
+        ])
+
+        with tempfile.TemporaryDirectory() as directory:
+            episode_dir = Path(directory)
+            (episode_dir / "agent_trace.log").write_text(trace, encoding="utf-8")
+            parsed = HermesHarness.parse_agent_trace(episode_dir)
+
+        calls = [event for event in parsed["events"] if event["type"] == "tool_call"]
+        results = [event for event in parsed["events"] if event["type"] == "tool_result"]
+        self.assertEqual([event["arguments"]["query"] for event in calls], ["first", "second"])
+        self.assertEqual([event["call_id"] for event in results], ["hermes-call-1", "hermes-call-2"])
+
+    def test_openclaw_trace_parser_standardizes_native_session(self):
+        stdout = {
+            "payloads": [{"text": "DONE"}],
+            "meta": {
+                "durationMs": 50,
+                "aborted": False,
+                "agentMeta": {
+                    "sessionId": "session-1",
+                    "provider": "openrouter",
+                    "model": "test-model",
+                    "usage": {"input": 10, "output": 5}
+                },
+                "systemPromptReport": {
+                    "systemPrompt": {"chars": 123, "hash": "prompt-hash"}
+                }
+            }
+        }
+        session = [
+            {"type": "session", "id": "session-1", "cwd": "/workspace"},
+            {
+                "type": "model_change",
+                "provider": "openrouter",
+                "modelId": "test-model"
+            },
+            {"type": "thinking_level_change", "thinkingLevel": "high"},
+            {
+                "type": "message",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Play through MCP tools."}]
+                }
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "I should search."},
+                        {"type": "text", "text": "I will verify this."},
+                        {
+                            "type": "toolCall",
+                            "id": "call-1",
+                            "name": "web_search",
+                            "arguments": {"query": "example"}
+                        }
+                    ]
+                }
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "call-1",
+                    "toolName": "web_search",
+                    "content": [{"type": "text", "text": "search result"}]
+                }
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "DONE"}]
+                }
+            }
+        ]
+        trajectory = [{
+            "type": "context.compiled",
+            "data": {
+                "systemPrompt": {
+                    "truncated": True,
+                    "originalChars": 123
+                },
+                "prompt": "Play through MCP tools.",
+                "tools": [{"name": "trajectory_tool"}]
+            }
+        }]
+        request = {
+            "messages": [
+                {"role": "system", "content": "Native OpenClaw instruction."},
+                {"role": "user", "content": "Play through MCP tools."}
+            ],
+            "tools": [{"type": "function", "function": {"name": "web_search"}}]
+        }
+        trace_lines = [
+            "agent_loop_instruction_start",
+            "Play through MCP tools.",
+            "agent_loop_instruction_end",
+            "openclaw_agent_stdout:",
+            json.dumps(stdout),
+            "openclaw_agent_stderr:",
+            "openclaw_session: /tmp/session-1.jsonl",
+            *[json.dumps(record) for record in session],
+            "openclaw_session: /tmp/session-1.trajectory.jsonl",
+            *[json.dumps(record) for record in trajectory],
+            "raw_upstream_request_1_start",
+            "path: /api/v1/chat/completions",
+            json.dumps(request),
+            "raw_upstream_request_1_end",
+            "raw_upstream_response_1_start",
+            "path: /api/v1/chat/completions",
+            "status: 200",
+            "content_type: application/json",
+            "content_encoding: identity",
+            json.dumps({"choices": []}),
+            "raw_upstream_response_1_end"
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            episode_dir = Path(directory)
+            (episode_dir / "agent_trace.log").write_text(
+                "\n".join(trace_lines),
+                encoding="utf-8",
+            )
+            parsed = OpenClawHarness.parse_agent_trace(episode_dir)
+
+        event_types = [event["type"] for event in parsed["events"]]
+        instruction_kinds = [event.get("kind") for event in parsed["events"]
+                             if event["type"] == "instruction"]
+        self.assertEqual(parsed["backend"], "openclaw")
+        self.assertEqual(instruction_kinds, ["native_harness", "agent_loop"])
+        self.assertIn("reasoning", event_types)
+        self.assertIn("tool_preamble", event_types)
+        self.assertIn("tool_call", event_types)
+        self.assertIn("tool_result", event_types)
+        self.assertIn("assistant_text", event_types)
+        self.assertEqual(parsed["runtime"]["thinking_level"], "high")
+        self.assertEqual(parsed["result"]["final_text"], "DONE")
+        self.assertEqual(parsed["capture"]["tool_definitions"]["source"], "wire_request")
+        self.assertEqual(parsed["capture"]["model_requests"]["count"], 1)
+        self.assertEqual(parsed["capture"]["model_responses"]["count"], 1)
+
+    def test_openclaw_trace_parser_treats_post_game_abort_as_termination(self):
+        session = [
+            {
+                "type": "message",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Play through MCP tools."}]
+                }
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall",
+                        "id": "call-1",
+                        "name": "clem_game__submit_response",
+                        "arguments": {"response": "GUESS: answer"}
+                    }]
+                }
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "call-1",
+                    "toolName": "clem_game__submit_response",
+                    "content": [{"type": "text", "text": "done: true"}],
+                    "details": {"structuredContent": {"done": True}}
+                }
+            },
+            {
+                "type": "custom",
+                "customType": "openclaw:prompt-error",
+                "data": {"error": "This operation was aborted | 20"}
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "aborted",
+                    "content": [{"type": "thinking", "thinking": "Partial final reasoning."}]
+                }
+            }
+        ]
+        trajectory = [{
+            "type": "session.ended",
+            "data": {
+                "status": "error",
+                "aborted": True,
+                "externalAbort": True,
+                "promptError": "This operation was aborted | 20"
+            }
+        }]
+        trace_lines = [
+            "openclaw_session: /tmp/session-1.jsonl",
+            *[json.dumps(record) for record in session],
+            "openclaw_session: /tmp/session-1.trajectory.jsonl",
+            *[json.dumps(record) for record in trajectory]
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            episode_dir = Path(directory)
+            (episode_dir / "agent_trace.log").write_text(
+                "\n".join(trace_lines),
+                encoding="utf-8",
+            )
+            parsed = OpenClawHarness.parse_agent_trace(episode_dir)
+
+        meaningful_events = [event for event in parsed["events"]
+                             if event["type"] in {"reasoning", "termination", "error"}]
+        self.assertEqual(
+            [event["type"] for event in meaningful_events],
+            ["reasoning", "termination"],
+        )
+        self.assertEqual(parsed["result"]["status"], "completed")
+        self.assertTrue(parsed["result"]["success"])
+        self.assertEqual(
+            parsed["result"]["terminal_reason"],
+            "terminated_after_game_completion",
         )
 
     def test_bridge_exposes_start_and_submit_without_get_state(self):
@@ -624,6 +1000,7 @@ class TestExternalAgentPipeline(unittest.TestCase):
         connection = {
             "backend": "openrouter",
             "model": "openrouter/openai/gpt-5-mini",
+            "base_url": "https://openrouter.ai/api/v1",
             "env": {"OPENROUTER_API_KEY": "openrouter-test-key"},
         }
         calls = []
@@ -739,13 +1116,13 @@ class TestExternalAgentPipeline(unittest.TestCase):
             run_dir = (
                 "openclaw-with-gpt-5-mini-openrouter--Llama-4-Maverick"
             )
-            trace_path = write_agent_trace(
+            trace_path = write_agent_artifacts(
                 results_dir=str(results_dir),
                 run_dir=run_dir,
                 game_name="taboo",
                 experiment_name="high_en",
                 game_id=0,
-                before_episode_dirs=set(),
+                before_instance_dirs=set(),
                 trace_text="openclaw failure",
                 metadata={
                     "started_at": datetime.now(timezone.utc).isoformat(),

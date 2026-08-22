@@ -5,7 +5,13 @@ import uvicorn
 
 from openenv.core import create_app
 
-from clemcore.clemgame import episode_results_folder_callbacks
+from clemcore.clemgame.callbacks.base import GameBenchmarkCallbackList
+from clemcore.clemgame.callbacks.files import (
+    ExperimentFileSaver,
+    InstanceFileSaver,
+    InteractionsFileSaver,
+    ResultsFolder
+)
 from clemcore.clemgame.envs.openenv.models import ClemGameAction, ClemGameObservation
 from clemcore.agents.mcp.environment import ClemGameMCPEnvironment, SelectableClemGameEnvironment
 
@@ -15,6 +21,7 @@ def result_run_dir_name(agent_name: str,
                         learner_agent: str = "player_0",
                         env_agents: dict[str, str] | None = None) -> str:
     """Return the deterministic clembench result directory for a player set."""
+
     registry_path = Path(registry_path).expanduser()
     with open(registry_path, "r", encoding="utf-8") as file:
         registry = json.load(file)
@@ -98,9 +105,13 @@ def run_clem_mcp_server(game_name: str,
         callbacks = None
 
         if results_dir is not None:
-            callbacks = episode_results_folder_callbacks(run_dir=run_dir,
-                                                         result_dir_path=results_dir,
-                                                         player_model_infos=None)
+            # explicitly infer the results folder and the instance folder via game id
+            results_folder = ResultsFolder(Path(results_dir), run_dir)
+            callbacks = GameBenchmarkCallbackList([
+                InstanceFileSaver(results_folder),
+                ExperimentFileSaver(results_folder),
+                InteractionsFileSaver(results_folder)
+            ])
 
         # ----- step 3 -----
         # define how OpenEnv builds an environment, called once per agent session

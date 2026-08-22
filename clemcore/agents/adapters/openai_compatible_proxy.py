@@ -225,7 +225,8 @@ class _ProxyServer(ThreadingHTTPServer):
                  request_body_overrides: dict[str, Any],
                  verify_tls: bool,
                  upstream_model: str | None,
-                 trace_responses: bool):
+                 trace_responses: bool,
+                 trace_requests: bool):
         super().__init__(("127.0.0.1", 0), _ProxyHandler)
         self.target_origin = target_origin
         self.completion_path = completion_path
@@ -233,8 +234,30 @@ class _ProxyServer(ThreadingHTTPServer):
         self.verify_tls = verify_tls
         self.upstream_model = upstream_model
         self.trace_responses = trace_responses
+        self.trace_requests = trace_requests
         self.response_trace_lock = threading.Lock()
         self.response_trace_count = 0
+        self.trace_records: list[str] = []
+
+    def trace_request(self,
+                      path: str,
+                      body: bytes) -> None:
+        if not self.trace_requests:
+            return
+
+        request_text = body.decode("utf-8", errors="replace")
+
+        with self.response_trace_lock:
+            self.response_trace_count += 1
+            trace_id = self.response_trace_count
+            trace_record = (
+                f"\nraw_upstream_request_{trace_id}_start\n"
+                f"path: {path}\n"
+                f"{request_text}\n"
+                f"raw_upstream_request_{trace_id}_end"
+            )
+            self.trace_records.append(trace_record)
+            print(trace_record, flush=True)
 
     def trace_response(self,
                        path: str,
@@ -250,16 +273,23 @@ class _ProxyServer(ThreadingHTTPServer):
         with self.response_trace_lock:
             self.response_trace_count += 1
             trace_id = self.response_trace_count
-            print(
+            trace_record = (
                 f"\nraw_upstream_response_{trace_id}_start\n"
                 f"path: {path}\n"
                 f"status: {status_code}\n"
                 f"content_type: {content_type}\n"
                 f"content_encoding: {content_encoding}\n"
                 f"{response_text}\n"
-                f"raw_upstream_response_{trace_id}_end",
-                flush=True,
+                f"raw_upstream_response_{trace_id}_end"
             )
+            self.trace_records.append(trace_record)
+            print(trace_record, flush=True)
+
+    def captured_trace(self) -> str:
+        """Return request and response records in their observed order."""
+
+        with self.response_trace_lock:
+            return "\n".join(self.trace_records)
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -275,6 +305,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             self.server.request_body_overrides,
             self.server.upstream_model,
         )
+        self.server.trace_request(self.path, body)
         headers = {
             name: value
             for name, value in self.headers.items()
@@ -400,7 +431,8 @@ class OpenAICompatibleProxy(AbstractContextManager["OpenAICompatibleProxy"]):
                  request_body_overrides: dict[str, Any] | None = None,
                  verify_tls: bool = True,
                  upstream_model: str | None = None,
-                 trace_responses: bool = True):
+                 trace_responses: bool = True,
+                 trace_requests: bool = False):
         parsed = urlsplit(target_base_url)
 
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -415,6 +447,7 @@ class OpenAICompatibleProxy(AbstractContextManager["OpenAICompatibleProxy"]):
             verify_tls=verify_tls,
             upstream_model=upstream_model,
             trace_responses=trace_responses,
+            trace_requests=trace_requests,
         )
         self._thread = threading.Thread(
             target=self._server.serve_forever,
@@ -426,6 +459,11 @@ class OpenAICompatibleProxy(AbstractContextManager["OpenAICompatibleProxy"]):
     def base_url(self) -> str:
         host, port = self._server.server_address
         return f"http://{host}:{port}{self._base_path}"
+
+    def captured_trace(self) -> str:
+        """Return request and response records captured by the proxy server."""
+
+        return self._server.captured_trace()
 
     def __enter__(self) -> "OpenAICompatibleProxy":
         if not self._server.verify_tls:
@@ -443,7 +481,8 @@ class OpenAICompatibleProxy(AbstractContextManager["OpenAICompatibleProxy"]):
 def proxy_for_model_connection(connection: dict[str, Any] | None,
                                completion_path: Path,
                                include_openrouter: bool = False,
-                               trace_responses: bool = True) -> OpenAICompatibleProxy | None:
+                               trace_responses: bool = True,
+                               trace_requests: bool = False) -> OpenAICompatibleProxy | None:
     if not connection:
         return None
 
@@ -469,4 +508,5 @@ def proxy_for_model_connection(connection: dict[str, Any] | None,
         verify_tls=bool(connection.get("verify_tls", True)),
         upstream_model=connection.get("model"),
         trace_responses=trace_responses,
+        trace_requests=trace_requests,
     )
